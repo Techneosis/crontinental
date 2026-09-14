@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""Run a command later, once or on a repeat, without creating a systemd unit for it.
+
+Usage:
+  techneosis-ai-schedule in 90m  --name pr-recheck -- gh pr checks 412
+  techneosis-ai-schedule at "tomorrow 09:00" --name thaw -- ~/bin/thaw-staging
+  techneosis-ai-schedule every "Mon..Fri 07:30" --name standup -- techneosis-sb agenda
+  techneosis-ai-schedule every 30m --name watch -- 'curl -sf https://x/health || exit 1'
+
+  techneosis-ai-schedule list [--all]      what is scheduled
+  techneosis-ai-schedule show <name>       one job, in full
+  techneosis-ai-schedule log <name>        its output, from the journal
+  techneosis-ai-schedule run <name>        fire it now, off-schedule
+  techneosis-ai-schedule rm <name>         drop it
+  techneosis-ai-schedule enable|disable <name>
+  techneosis-ai-schedule tick              what the timer calls (dispatch what is due)
+  techneosis-ai-schedule exec <name>       what a job's own unit calls (internal)
+
+Design, and why it is split this way:
+
+  DURABILITY lives in this database, not in systemd. `systemd-run --on-calendar`
+  can schedule a command with no files at all, but the transient timer it
+  creates dies with the user manager -- so "run this tomorrow at 09:00" silently
+  evaporates at the next reboot, which on Arch is never far away. A row survives.
+
+  THE HEARTBEAT is one timer (techneosis-ai-schedule.timer, 1/min) shared by
+  every job, so adding work never means adding a unit, a daemon-reload, or an
+  enable. That is the entire point: agents schedule things, and agent-written
+  unit files would accumulate outside the dotfiles repo and drift from it.
+
+  EXECUTION is a transient unit per run, via systemd-run. Each job therefore
+  gets its own cgroup, its own journal stream (`journalctl --user -u
+  techneosis-ai-job-<name>`), and its own RuntimeMaxSec -- none of which a tick
+  that ran jobs inline could give it, and any one of which a wedged job would
+  otherwise take from every other job. The tick only ever spawns and returns, so
+  it stays sub-second no matter what it launched.
+
+  Calendar and timespan parsing is systemd's (`systemd-analyze calendar` /
+  `timespan`), never hand-rolled: same grammar as every unit on this box, and
+  no cron-parser dependency to keep alive.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import signal
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "techneosis-schedule"
+DB_PATH = Path(os.environ.get("SCHEDULE_DB", DATA_DIR / "schedule.db"))
+SELF = str(Path(__file__).resolve())
+
+SCHEMA_VERSION = 1
+UNIT_PREFIX = "techneosis-ai-job-"
+GLYPH = "󰃰"
+
+# A run that fires within this many seconds of its due time is "on time". The
+# tick is 1/min, so an on-time fire is always under 60s late; anything past this
+# means the machine was asleep, off, or wedged -- which is exactly the case
+# --catchup decides.
+GRACE_SEC = 120
+
+DEFAULT_TIMEOUT_SEC = 3600
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS job (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT NOT NULL UNIQUE,
+  command      TEXT NOT NULL,
+  workdir      TEXT,
+  kind         TEXT NOT NULL,              -- 'once' | 'repeat'
+  spec         TEXT,                       -- calendar spec, or a timespan for fixed intervals
+  interval_sec INTEGER,                    -- set when spec is a timespan rather than a calendar
+  next_run     TEXT,                       -- ISO-8601 UTC; NULL once a one-off has fired
+  catchup      TEXT NOT NULL DEFAULT 'run',-- 'run' | 'skip' a fire that is more than GRACE_SEC late
+  until        TEXT,                       -- repeats stop here
+  timeout_sec  INTEGER NOT NULL,
+  notify       TEXT NOT NULL DEFAULT 'fail', -- 'never' | 'fail' | 'always'
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  note         TEXT,
+  created_at   TEXT NOT NULL,
+  created_by   TEXT
+);
+CREATE INDEX IF NOT EXISTS job_due ON job(enabled, next_run);
+
+-- History is per RUN, not per job, so "it failed" and "it failed every night
+-- this week" are different-looking facts rather than the same overwritten row.
+CREATE TABLE IF NOT EXISTS run (
+  id          INTEGER PRIMARY KEY,
+  job_id      INTEGER NOT NULL REFERENCES job(id) ON DELETE CASCADE,
+  unit        TEXT,
+  due_at      TEXT,
+  started_at  TEXT,
+  finished_at TEXT,
+  status      INTEGER,                     -- process exit code; NULL while running
+  outcome     TEXT NOT NULL,               -- 'running'|'ok'|'fail'|'killed'|'skipped'|'overlap'|'error'
+  late_sec    INTEGER,
+  detail      TEXT
+);
+CREATE INDEX IF NOT EXISTS run_job ON run(job_id, id DESC);
+"""
+
+
+# --------------------------------------------------------------------------- db
+
+def now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def iso(dt: datetime | None) -> str | None:
+    return dt.isoformat() if dt else None
+
+
+def parse_iso(s: str | None) -> datetime | None:
+    return datetime.fromisoformat(s) if s else None
+
+
+def connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    # WAL so a job's own `exec` writing its result never blocks the tick that is
+    # trying to dispatch the next one.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(SCHEMA)
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    conn.commit()
+    return conn
+
+
+def get_job(conn, name: str) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM job WHERE name=?", (name,)).fetchone()
+    if not row:
+        die(f"no such job: {name}")
+    return row
+
+
+def die(msg: str, code: int = 1):
+    print(f"techneosis-ai-schedule: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------- time parsing
+
+def systemd_calendar(spec: str, after: datetime | None = None) -> datetime | None:
+    """Next elapse of a systemd OnCalendar spec, or None if it never elapses again.
+
+    Raises ValueError when the spec is not a calendar expression at all, which is
+    how `every 30m` falls through to the timespan reading.
+    """
+    cmd = ["systemd-analyze", "calendar", "--iterations=1"]
+    if after is not None:
+        # --base-time takes a local/absolute stamp; feed it UTC explicitly so a
+        # DST boundary cannot shift the answer by an hour.
+        cmd += ["--base-time", after.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")]
+    p = subprocess.run(cmd + [spec], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise ValueError(p.stderr.strip().splitlines()[0] if p.stderr else "invalid calendar spec")
+    if re.search(r"Next elapse:\s*never", p.stdout):
+        return None
+    m = re.search(r"\(in UTC\):\s*\w{3} (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC", p.stdout)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def systemd_timespan(spec: str) -> int:
+    """Seconds in a systemd timespan ("90m", "2h 30min", "1d"). Raises ValueError."""
+    p = subprocess.run(["systemd-analyze", "timespan", spec], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise ValueError(p.stderr.strip().splitlines()[0] if p.stderr else "invalid timespan")
+    m = re.search(r"μs:\s*(\d+)", p.stdout) or re.search(r"us:\s*(\d+)", p.stdout)
+    if not m:
+        raise ValueError("could not read timespan")
+    return int(m.group(1)) // 1_000_000
+
+
+def parse_when(spec: str) -> datetime:
+    """An absolute one-off time. `date -d` because it takes what a human types."""
+    p = subprocess.run(["date", "-d", spec, "+%s"], capture_output=True, text=True)
+    if p.returncode != 0:
+        die(f"could not understand the time {spec!r} (try \"2026-09-15 09:00\" or \"tomorrow 07:00\")")
+    return datetime.fromtimestamp(int(p.stdout.strip()), timezone.utc)
+
+
+def next_fire(row, after: datetime) -> datetime | None:
+    """When a repeat should next run, measured from `after` -- never from the
+    due time it missed. A box that was asleep for a day therefore wakes owing at
+    most one run of each job, not a day's worth queued up behind each other."""
+    if row["interval_sec"]:
+        return after + timedelta(seconds=row["interval_sec"])
+    return systemd_calendar(row["spec"], after=after)
+
+
+# --------------------------------------------------------------------------- misc
+
+def unit_name(name: str) -> str:
+    return f"{UNIT_PREFIX}{name}.service"
+
+
+def valid_name(name: str) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,48}", name):
+        die(f"bad job name {name!r}: lowercase letters, digits, - and _ only "
+            "(it becomes a systemd unit name)")
+    return name
+
+
+def default_name(command: str) -> str:
+    base = Path(shlex.split(command)[0]).name if command.strip() else "job"
+    base = re.sub(r"[^a-z0-9_-]+", "-", base.lower()).strip("-") or "job"
+    return f"{base}-{now().strftime('%m%d%H%M%S')}"
+
+
+def provenance() -> str:
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        return f"claude:{sid[:8]}"
+    return os.environ.get("USER", "unknown")
+
+
+def notify(headline: str, body: str, critical: bool = False):
+    try:
+        subprocess.run(
+            ["omarchy-notification-send", "-g", GLYPH,
+             "-u", "critical" if critical else "low", headline, body],
+            capture_output=True, timeout=10, check=False)
+    except Exception:
+        pass  # a missing notifier must never fail a job
+
+
+def humanize(dt: datetime | None) -> str:
+    if dt is None:
+        return "-"
+    local = dt.astimezone()
+    delta = (dt - now()).total_seconds()
+    if abs(delta) < 5:
+        return f"{local:%a %m-%d %H:%M} (just now)"
+    sign, delta = ("in ", delta) if delta >= 0 else ("", -delta)
+    if delta < 90:
+        rel = f"{sign}{int(delta)}s" if sign else f"{int(delta)}s ago"
+    elif delta < 5400:
+        rel = f"{sign}{int(delta // 60)}m" if sign else f"{int(delta // 60)}m ago"
+    elif delta < 172800:
+        rel = f"{sign}{delta / 3600:.1f}h" if sign else f"{delta / 3600:.1f}h ago"
+    else:
+        rel = f"{sign}{int(delta // 86400)}d" if sign else f"{int(delta // 86400)}d ago"
+    return f"{local:%a %m-%d %H:%M} ({rel})"
+
+
+# --------------------------------------------------------------------------- add
+
+def cmd_add(args, kind: str):
+    command = join_command(args.command)
+    if not command:
+        die("no command given -- put it after `--`")
+    name = valid_name(args.name) if args.name else default_name(command)
+
+    conn = connect()
+    if conn.execute("SELECT 1 FROM job WHERE name=?", (name,)).fetchone():
+        die(f"a job named {name!r} already exists (rm it, or pass a different --name)")
+
+    interval = None
+    spec = None
+    if kind == "once":
+        if args.at:
+            when = parse_when(args.when)
+        else:
+            try:
+                when = now() + timedelta(seconds=systemd_timespan(args.when))
+            except ValueError as e:
+                die(f"{args.when!r} is not a delay: {e} (try 90m, 2h, 1d)")
+        if when <= now():
+            die(f"that time is in the past: {when.astimezone():%Y-%m-%d %H:%M}")
+        default_catchup = "run"
+    else:
+        spec = args.when
+        try:
+            when = systemd_calendar(spec)
+            if when is None:
+                die(f"calendar spec {spec!r} never elapses")
+        except ValueError as cal_err:
+            # systemd's own error for this case suggests the timespan reading,
+            # so `every 30m` means every 30 minutes rather than being rejected.
+            try:
+                interval = systemd_timespan(spec)
+            except ValueError as span_err:
+                # Report BOTH readings. A spec like "daily 03:00" is an attempt
+                # at a calendar, and showing only the timespan complaint sends
+                # the reader looking in the wrong grammar entirely.
+                die(f"{spec!r} is neither a calendar spec nor an interval.\n"
+                    f"  as a calendar: {cal_err}\n"
+                    f"  as an interval: {span_err}\n"
+                    f"  calendar examples: \"03:00\", \"Mon..Fri 07:30\", \"*-*-01 09:00\", \"hourly\"\n"
+                    f"  interval examples: 30m, 2h, 1d\n"
+                    f"  check one with: systemd-analyze calendar {shlex.quote(spec)}")
+            if interval < 60:
+                die(f"interval {spec!r} is shorter than the 1-minute tick")
+            when = now() + timedelta(seconds=interval)
+        # systemd's own default for a missed timer run is to skip it, and the
+        # same reasoning holds here: a nightly job that wakes at noon usually
+        # wants tonight, not a surprise run in the middle of the day.
+        default_catchup = "skip"
+
+    until = parse_when(args.until) if args.until else None
+    workdir = str(Path(args.workdir).expanduser().resolve()) if args.workdir else None
+    if workdir and not Path(workdir).is_dir():
+        die(f"--workdir is not a directory: {workdir}")
+
+    conn.execute(
+        "INSERT INTO job (name, command, workdir, kind, spec, interval_sec, next_run,"
+        " catchup, until, timeout_sec, notify, note, created_at, created_by)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (name, command, workdir, kind, spec, interval, iso(when),
+         args.catchup or default_catchup, iso(until),
+         systemd_timespan(args.timeout) if args.timeout else DEFAULT_TIMEOUT_SEC,
+         args.notify, args.note, iso(now()), args.by or provenance()))
+    conn.commit()
+
+    print(f"{name}: next run {humanize(when)}")
+    if kind == "repeat":
+        print(f"  repeating: {'every ' + spec if interval else spec}")
+    print(f"  command: {command}")
+
+
+def join_command(parts: list[str]) -> str:
+    """One argument after `--` is a shell line, verbatim, so pipes and && survive.
+    Several are an argv, quoted safely. Both end up as a string for `bash -lc`."""
+    if len(parts) == 1:
+        return parts[0]
+    return shlex.join(parts)
+
+
+# -------------------------------------------------------------------------- tick
+
+def cmd_tick(args):
+    conn = connect()
+    t = now()
+    due = conn.execute(
+        "SELECT * FROM job WHERE enabled=1 AND next_run IS NOT NULL AND next_run<=?"
+        " ORDER BY next_run", (iso(t),)).fetchall()
+
+    for row in due:
+        due_at = parse_iso(row["next_run"])
+        late = int((t - due_at).total_seconds())
+
+        if row["until"] and t >= parse_iso(row["until"]):
+            conn.execute("UPDATE job SET enabled=0, next_run=NULL WHERE id=?", (row["id"],))
+            conn.commit()
+            continue
+
+        # Advance BEFORE dispatching. If anything below throws, the job has
+        # already moved on -- the alternative is a job that failed to launch
+        # being retried every 60 seconds forever.
+        advance(conn, row, t)
+
+        if row["catchup"] == "skip" and late > GRACE_SEC:
+            record(conn, row, due_at, late, outcome="skipped",
+                   detail=f"{late}s late; catchup=skip")
+            continue
+
+        dispatch(conn, row, due_at, late)
+
+
+def advance(conn, row, t: datetime):
+    if row["kind"] == "once":
+        conn.execute("UPDATE job SET next_run=NULL, enabled=0 WHERE id=?", (row["id"],))
+    else:
+        nxt = next_fire(row, t)
+        if nxt and row["until"] and nxt >= parse_iso(row["until"]):
+            nxt = None
+        conn.execute("UPDATE job SET next_run=?, enabled=? WHERE id=?",
+                     (iso(nxt), 1 if nxt else 0, row["id"]))
+    conn.commit()
+
+
+def record(conn, row, due_at, late, outcome, detail=None, unit=None):
+    conn.execute(
+        "INSERT INTO run (job_id, unit, due_at, started_at, finished_at, outcome, late_sec, detail)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (row["id"], unit, iso(due_at), iso(now()), iso(now()), outcome, late, detail))
+    conn.commit()
+
+
+def dispatch(conn, row, due_at, late):
+    unit = unit_name(row["name"])
+    # systemd-run starts the unit from the user manager's environment, not this
+    # process's, so a SCHEDULE_DB override has to be handed over explicitly --
+    # otherwise a test tick dispatches jobs that record into the real database.
+    setenv = [f"--setenv=SCHEDULE_DB={os.environ['SCHEDULE_DB']}"] if "SCHEDULE_DB" in os.environ else []
+    p = subprocess.run(
+        ["systemd-run", "--user", "--no-block", "--collect", f"--unit={unit}",
+         f"--description=scheduled job: {row['name']}",
+         f"--property=RuntimeMaxSec={row['timeout_sec']}", *setenv,
+         # The unit runs `exec`, not the command itself: something has to outlive
+         # the command to write down what it did, and this is the only process
+         # inside the job's own cgroup that can.
+         SELF, "exec", row["name"], "--due", iso(due_at), "--late", str(late)],
+        capture_output=True, text=True)
+
+    if p.returncode != 0:
+        err = (p.stderr or "").strip()
+        # The transient unit name is the job name, so systemd itself refuses a
+        # second copy of a job that is still running. That refusal IS the
+        # overlap guard -- there is no lockfile to go stale.
+        # systemd words this refusal several ways depending on how far the old
+        # unit got ("already loaded or has a fragment file", "already exists",
+        # "is already running"); all of them mean the same thing here.
+        low = err.lower()
+        overlap = "already" in low and any(w in low for w in ("loaded", "exists", "running", "active"))
+        record(conn, row, due_at, late, outcome="overlap" if overlap else "error",
+               detail=err[:500], unit=unit)
+        if not overlap and row["notify"] != "never":
+            notify("Scheduled job could not start", f"{row['name']}: {err[:160]}", critical=True)
+
+
+# -------------------------------------------------------------------------- exec
+
+def cmd_exec(args):
+    """What the transient unit runs. Streams the command's own output straight
+    to the journal (no capture) so `log` has one source of truth."""
+    conn = connect()
+    row = get_job(conn, args.name)
+    unit = unit_name(args.name)
+    due_at = parse_iso(args.due) if args.due else now()
+    started = now()
+
+    cur = conn.execute(
+        "INSERT INTO run (job_id, unit, due_at, started_at, outcome, late_sec)"
+        " VALUES (?,?,?,?, 'running', ?)",
+        (row["id"], unit, iso(due_at), iso(started), args.late))
+    run_id = cur.lastrowid
+    conn.commit()
+
+    def finish(status: int, outcome: str, detail=None):
+        conn.execute("UPDATE run SET finished_at=?, status=?, outcome=?, detail=? WHERE id=?",
+                     (iso(now()), status, outcome, detail, run_id))
+        conn.commit()
+
+    def on_term(signum, _frame):
+        # RuntimeMaxSec expired, or someone stopped the unit. systemd kills the
+        # whole cgroup, so the child is already going; all that is left is to
+        # say so before this process goes too.
+        finish(128 + signum, "killed", f"stopped by signal {signum}")
+        if row["notify"] != "never":
+            notify("Scheduled job killed", f"{row['name']} hit its {row['timeout_sec']}s limit",
+                   critical=True)
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, on_term)
+
+    try:
+        p = subprocess.run(["/usr/bin/bash", "-lc", row["command"]],
+                           cwd=row["workdir"] or str(Path.home()))
+        status = p.returncode
+    except Exception as e:  # noqa: BLE001 - the unit must still record why
+        finish(-1, "error", str(e)[:500])
+        if row["notify"] != "never":
+            notify("Scheduled job errored", f"{row['name']}: {e}"[:160], critical=True)
+        sys.exit(1)
+
+    elapsed = int((now() - started).total_seconds())
+    finish(status, "ok" if status == 0 else "fail")
+
+    if status != 0 and row["notify"] in ("fail", "always"):
+        notify("Scheduled job failed",
+               f"{row['name']} exited {status} after {elapsed}s — "
+               f"techneosis-ai-schedule log {row['name']}", critical=True)
+    elif status == 0 and row["notify"] == "always":
+        notify("Scheduled job done", f"{row['name']} finished in {elapsed}s")
+
+    sys.exit(status)  # the unit's own state should mirror the job's
+
+
+# --------------------------------------------------------------------- inspection
+
+def last_run(conn, job_id):
+    return conn.execute(
+        "SELECT * FROM run WHERE job_id=? ORDER BY id DESC LIMIT 1", (job_id,)).fetchone()
+
+
+def cmd_list(args):
+    conn = connect()
+    q = "SELECT * FROM job"
+    if not args.all:
+        q += " WHERE enabled=1"
+    rows = conn.execute(q + " ORDER BY enabled DESC, next_run IS NULL, next_run").fetchall()
+    if not rows:
+        print("nothing scheduled" + ("" if args.all else " (--all also shows finished and disabled jobs)"))
+        return
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2))
+        return
+
+    w = max(len(r["name"]) for r in rows)
+    for r in rows:
+        lr = last_run(conn, r["id"])
+        state = "" if r["enabled"] else ("done" if r["kind"] == "once" and lr else "off")
+        when = humanize(parse_iso(r["next_run"])) if r["next_run"] else state or "-"
+        mark = {"ok": "ok", "fail": "FAIL", "killed": "KILLED", "running": "running",
+                "skipped": "skipped", "overlap": "overlap", "error": "ERROR"}.get(
+                    lr["outcome"], "") if lr else ""
+        kind = "every " + (r["spec"] or "") if r["kind"] == "repeat" else "once"
+        cmdtxt = r["command"] if len(r["command"]) <= 44 else r["command"][:41] + "..."
+        print(f"{r['name']:<{w}}  {when:<26} {kind:<22} {mark:<8} {cmdtxt}")
+
+
+def cmd_show(args):
+    conn = connect()
+    r = get_job(conn, args.name)
+    print(f"name        {r['name']}")
+    print(f"command     {r['command']}")
+    print(f"workdir     {r['workdir'] or '~ (login shell, bash -lc)'}")
+    print(f"kind        {r['kind']}" + (f" — {'every ' + r['spec'] if r['spec'] else ''}" if r["kind"] == "repeat" else ""))
+    print(f"next run    {humanize(parse_iso(r['next_run'])) if r['next_run'] else '-'}")
+    print(f"catchup     {r['catchup']}  (a fire >{GRACE_SEC}s late is {'run anyway' if r['catchup'] == 'run' else 'skipped'})")
+    print(f"timeout     {r['timeout_sec']}s")
+    print(f"notify      {r['notify']}")
+    print(f"enabled     {'yes' if r['enabled'] else 'no'}")
+    print(f"until       {humanize(parse_iso(r['until'])) if r['until'] else '-'}")
+    print(f"created     {humanize(parse_iso(r['created_at']))} by {r['created_by']}")
+    if r["note"]:
+        print(f"note        {r['note']}")
+    print(f"unit        {unit_name(r['name'])}")
+    runs = conn.execute("SELECT * FROM run WHERE job_id=? ORDER BY id DESC LIMIT 10",
+                        (r["id"],)).fetchall()
+    if runs:
+        print("\nrecent runs")
+        for x in runs:
+            dur = ""
+            if x["started_at"] and x["finished_at"]:
+                dur = f"{int((parse_iso(x['finished_at']) - parse_iso(x['started_at'])).total_seconds())}s"
+            print(f"  {parse_iso(x['started_at']).astimezone():%m-%d %H:%M}  "
+                  f"{x['outcome']:<9} {'exit ' + str(x['status']) if x['status'] is not None else '':<9}"
+                  f"{dur:<7} {'late ' + str(x['late_sec']) + 's' if (x['late_sec'] or 0) > GRACE_SEC else ''}"
+                  f" {x['detail'] or ''}")
+
+
+def cmd_log(args):
+    conn = connect()
+    r = get_job(conn, args.name)
+    subprocess.run(["journalctl", "--user", "-u", unit_name(r["name"]),
+                    "-n", str(args.lines), "--no-pager"] + (["-f"] if args.follow else []))
+
+
+def cmd_run(args):
+    conn = connect()
+    r = get_job(conn, args.name)
+    # Off-schedule, so next_run is deliberately untouched: testing a job must
+    # not move the schedule it is being tested against.
+    dispatch(conn, r, now(), 0)
+    print(f"{r['name']}: started — techneosis-ai-schedule log {r['name']}")
+
+
+def cmd_rm(args):
+    conn = connect()
+    r = get_job(conn, args.name)
+    subprocess.run(["systemctl", "--user", "stop", unit_name(r["name"])],
+                   capture_output=True)
+    conn.execute("DELETE FROM job WHERE id=?", (r["id"],))
+    conn.commit()
+    print(f"removed {r['name']}")
+
+
+def cmd_toggle(args, on: bool):
+    conn = connect()
+    r = get_job(conn, args.name)
+    nxt = parse_iso(r["next_run"])
+    if on and (nxt is None or nxt <= now()):
+        if r["kind"] == "once":
+            die(f"{r['name']} is a one-off that has already run; schedule a new one")
+        nxt = next_fire(r, now())
+        if nxt is None or (r["until"] and nxt >= parse_iso(r["until"])):
+            die(f"{r['name']} has passed its --until ({humanize(parse_iso(r['until']))}); "
+                "schedule a new one")
+    conn.execute("UPDATE job SET enabled=?, next_run=? WHERE id=?",
+                 (1 if on else 0, iso(nxt) if on else r["next_run"], r["id"]))
+    conn.commit()
+    print(f"{r['name']}: {'enabled, next run ' + humanize(nxt) if on else 'disabled'}")
+
+
+def cmd_prune(args):
+    conn = connect()
+    cutoff = iso(now() - timedelta(days=args.days))
+    n = conn.execute(
+        "DELETE FROM job WHERE kind='once' AND enabled=0 AND created_at<?", (cutoff,)).rowcount
+    conn.commit()
+    conn.execute("VACUUM")
+    print(f"pruned {n} finished one-off job(s) older than {args.days}d")
+
+
+# --------------------------------------------------------------------------- cli
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="techneosis-ai-schedule",
+        description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Everything after `--` is the command. One argument is taken as a\n"
+               "shell line (pipes and && work); several are taken as an argv.\n"
+               "Every job runs under `bash -lc`, so node/mise/~/.local/bin are on\n"
+               "PATH exactly as they are in a terminal.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def add_common(p):
+        p.add_argument("--name", help="job name; also its systemd unit name")
+        p.add_argument("--workdir", help="run here (default: $HOME)")
+        p.add_argument("--timeout", help="kill the run after this long (default 1h)")
+        p.add_argument("--catchup", choices=["run", "skip"],
+                       help="a fire more than %ds late: run it anyway, or skip to the "
+                            "next one (default: run for one-offs, skip for repeats)" % GRACE_SEC)
+        p.add_argument("--until", help="stop repeating after this time")
+        p.add_argument("--notify", choices=["never", "fail", "always"], default="fail")
+        p.add_argument("--note", help="why this exists")
+        p.add_argument("--by", help="who scheduled it (default: the Claude session, or $USER)")
+
+    p = sub.add_parser("in", help="run once, after a delay (90m, 2h, 1d)")
+    p.add_argument("when")
+    add_common(p)
+    p.set_defaults(func=lambda a: cmd_add(a, "once"), at=False)
+
+    p = sub.add_parser("at", help='run once, at a time ("2026-09-15 09:00", "tomorrow 07:00")')
+    p.add_argument("when")
+    add_common(p)
+    p.set_defaults(func=lambda a: cmd_add(a, "once"), at=True)
+
+    p = sub.add_parser("every", help='repeat: a calendar spec ("Mon..Fri 07:30", "daily") or an interval ("30m")')
+    p.add_argument("when")
+    add_common(p)
+    p.set_defaults(func=lambda a: cmd_add(a, "repeat"), at=False)
+
+    p = sub.add_parser("list", help="what is scheduled")
+    p.add_argument("--all", action="store_true", help="include finished and disabled jobs")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("show", help="one job, in full, with its recent runs")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("log", help="the job's output, from the journal")
+    p.add_argument("name")
+    p.add_argument("-n", "--lines", type=int, default=50)
+    p.add_argument("-f", "--follow", action="store_true")
+    p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("run", help="fire it now, without moving its schedule")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("rm", help="remove a job")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("enable", help="resume a disabled job")
+    p.add_argument("name")
+    p.set_defaults(func=lambda a: cmd_toggle(a, True))
+
+    p = sub.add_parser("disable", help="stop a job without removing it")
+    p.add_argument("name")
+    p.set_defaults(func=lambda a: cmd_toggle(a, False))
+
+    p = sub.add_parser("prune", help="drop finished one-offs")
+    p.add_argument("--days", type=int, default=7)
+    p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("tick", help="dispatch everything due (the timer calls this)")
+    p.set_defaults(func=cmd_tick)
+
+    p = sub.add_parser("exec", help=argparse.SUPPRESS)
+    p.add_argument("name")
+    p.add_argument("--due")
+    p.add_argument("--late", type=int, default=0)
+    p.set_defaults(func=cmd_exec)
+
+    p = sub.add_parser("path", help="print the database path")
+    p.set_defaults(func=lambda a: print(DB_PATH))
+
+    # Split the command off BEFORE argparse sees it. argparse.REMAINDER would
+    # start collecting at the first token after the time argument and swallow
+    # --name and friends along with it; splitting on the first literal `--`
+    # keeps the option/command boundary exactly where the user typed it, and
+    # leaves any further `--` inside the command untouched.
+    argv = sys.argv[1:]
+    command: list[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, command = argv[:i], argv[i + 1:]
+
+    args = ap.parse_args(argv)
+    args.command = command
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

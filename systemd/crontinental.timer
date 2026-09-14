@@ -1,0 +1,24 @@
+[Unit]
+Description=Scheduled command tick (one-off and recurring jobs)
+
+[Timer]
+# One minute is the resolution of the whole scheduler: a job can be no more
+# precise than this tick, and `techneosis-ai-schedule` refuses intervals shorter
+# than it for that reason. The tick itself only reads a table and spawns what is
+# due, so it costs a few milliseconds even when it finds work.
+OnBootSec=30s
+OnUnitActiveSec=1min
+
+# Without this the tick is worthless. systemd's default AccuracySec is ONE
+# MINUTE, so it is free to fire a 1/min timer anywhere inside each minute --
+# which makes "run at 09:00" land at 09:00:58 and, worse, makes it drift.
+AccuracySec=1s
+
+# NOT Persistent, deliberately: due times live in the job table, so a tick
+# missed while the box was asleep needs no catch-up run of its own. The first
+# tick after resume finds everything that came due meanwhile and applies each
+# job's own --catchup policy, which is a decision systemd's all-or-nothing
+# Persistent= cannot express per job.
+
+[Install]
+WantedBy=timers.target
