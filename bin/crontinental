@@ -15,6 +15,7 @@ Usage:
   techneosis-ai-schedule enable|disable <name>
   techneosis-ai-schedule tick              what the timer calls (dispatch what is due)
   techneosis-ai-schedule exec <name>       what a job's own unit calls (internal)
+  techneosis-ai-schedule names [--enabled|--disabled]   bare job names (tab completion)
 
 Design, and why it is split this way:
 
@@ -512,6 +513,18 @@ def cmd_list(args):
         print(f"{r['name']:<{w}}  {when:<26} {kind:<22} {mark:<8} {cmdtxt}")
 
 
+def cmd_names(args):
+    """Bare names, one per line -- what tab completion reads. Every job by
+    default: show/log/rm are as useful on a finished one-off as on a live one."""
+    q = "SELECT name FROM job"
+    if args.enabled:
+        q += " WHERE enabled=1"
+    elif args.disabled:
+        q += " WHERE enabled=0"
+    for (name,) in connect().execute(q + " ORDER BY name"):
+        print(name)
+
+
 def cmd_show(args):
     conn = connect()
     r = get_job(conn, args.name)
@@ -674,11 +687,17 @@ def main():
     p = sub.add_parser("tick", help="dispatch everything due (the timer calls this)")
     p.set_defaults(func=cmd_tick)
 
-    p = sub.add_parser("exec", help=argparse.SUPPRESS)
+    p = sub.add_parser("exec")
     p.add_argument("name")
     p.add_argument("--due")
     p.add_argument("--late", type=int, default=0)
     p.set_defaults(func=cmd_exec)
+
+    p = sub.add_parser("names")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--enabled", action="store_true")
+    g.add_argument("--disabled", action="store_true")
+    p.set_defaults(func=cmd_names)
 
     p = sub.add_parser("path", help="print the database path")
     p.set_defaults(func=lambda a: print(DB_PATH))
