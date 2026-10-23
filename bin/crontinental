@@ -53,6 +53,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -264,11 +265,18 @@ def provenance() -> str:
 
 
 def notify(headline: str, body: str, critical: bool = False):
+    urgency = "critical" if critical else "low"
+    # Omarchy's own sender where it exists: it carries the glyph and, unlike a
+    # bare notify-send there, survives the desktop's notification changes.
+    # Everywhere else the freedesktop standard.
+    if shutil.which("omarchy-notification-send"):
+        cmd = ["omarchy-notification-send", "-g", GLYPH, "-u", urgency, headline, body]
+    elif shutil.which("notify-send"):
+        cmd = ["notify-send", "-a", "crontinental", "-u", urgency, headline, body]
+    else:
+        return
     try:
-        subprocess.run(
-            ["omarchy-notification-send", "-g", GLYPH,
-             "-u", "critical" if critical else "low", headline, body],
-            capture_output=True, timeout=10, check=False)
+        subprocess.run(cmd, capture_output=True, timeout=10, check=False)
     except Exception:
         pass  # a missing notifier must never fail a job
 
