@@ -4,7 +4,7 @@
 Usage:
   crontinental in 90m  --name pr-recheck -- gh pr checks 412
   crontinental at "tomorrow 09:00" --name thaw -- ~/bin/thaw-staging
-  crontinental every "Mon..Fri 07:30" --name standup --forever -- techneosis-sb agenda
+  crontinental every "Mon..Fri 07:30" --name backup --forever -- restic backup ~/work
   crontinental every 30m --name watch --until "2 hours" -- 'curl -sf https://x/health || exit 1'
 
   crontinental list [--all]      what is scheduled
@@ -27,7 +27,7 @@ Design, and why it is split this way:
   THE HEARTBEAT is one timer (crontinental.timer, 1/min) shared by
   every job, so adding work never means adding a unit, a daemon-reload, or an
   enable. That is the entire point: agents schedule things, and agent-written
-  unit files would accumulate outside the dotfiles repo and drift from it.
+  unit files would otherwise pile up in ~/.config/systemd/user, unowned.
 
   EXECUTION is a transient unit per run, via systemd-run. Each job therefore
   gets its own cgroup, its own journal stream (`journalctl --user -u

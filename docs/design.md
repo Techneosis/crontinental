@@ -1,4 +1,7 @@
-# crontinental
+# Crontinental: how it works
+
+*The house rules are in the [README](../README.md); this is the building
+plan.*
 
 Run a command later — once, or on a repeat — without creating a systemd unit
 for it. Built so an agent can schedule work mid-session and have it survive the
@@ -7,7 +10,7 @@ session, the logout, and the reboot.
 ```
 crontinental in 90m  --name pr-recheck -- gh pr checks 412
 crontinental at "tomorrow 07:00" --name thaw -- ~/bin/thaw-staging
-crontinental every "Mon..Fri 07:30" --name standup --forever -- techneosis-sb agenda
+crontinental every "Mon..Fri 07:30" --name backup --forever -- restic backup ~/work
 crontinental every 30m --name health --until "2 hours" -- 'curl -sf https://x/health || exit 1'
 crontinental every 10m --name deploy-wait --until-done --until "tomorrow" -- 'deploy-is-live && exit 99'
 ```
@@ -17,7 +20,7 @@ crontinental every 10m --name deploy-wait --until-done --until "tomorrow" -- 'de
 Because it forgets. `systemd-run` creates a *transient* timer, and transient
 units die with the user manager — so a job scheduled for tomorrow morning
 evaporates at the next reboot, silently, with nothing to show that it was ever
-scheduled. On Arch that is not a rare event.
+scheduled. On a rolling-release distro that is not a rare event.
 
 So the three concerns are split deliberately:
 
@@ -42,11 +45,15 @@ Everything after `--` is the command.
 - **Several arguments** are taken as an argv and quoted safely:
   `-- gh pr checks 412`
 
-Every job runs under `bash -lc`, so its PATH is the login shell's — node, mise,
-`~/.local/bin`, `dotfiles/scripts`. This is not cosmetic: systemd's own PATH has
-none of those, which is the trap that makes a node-touching command work by hand
-and fail only when scheduled (the same one documented in
-`techneosis-ai-dispatch-triage.service`).
+Every job runs under `bash -lc`, so its PATH is the login shell's: nvm, mise,
+`~/.local/bin`, whatever your profile adds. This is not cosmetic. systemd's own
+PATH has none of those, which is the trap that makes a node-touching command
+work by hand and fail only when scheduled.
+
+One version of that trap survives the login shell. If your profile puts mise's
+shims ahead of nvm and mise has no global node, `node`/`npx` resolve to a shim
+that refuses to run ("No version is set for shim"). Fix it inside the job (put
+the node you want first on PATH), not with a global default.
 
 ## Schedules
 
@@ -165,8 +172,12 @@ from finishing: a disabled job is kept until someone removes it.
 
 ## Files
 
-- `scripts/crontinental` — the whole thing
-- `systemd/.config/systemd/user/crontinental.{timer,service}` — the tick
-- `~/.local/share/crontinental/ledger.db` — jobs and run history
-  (`CRONTINENTAL_DB` overrides it, which is how the tool is tested without touching
+- `bin/crontinental`: the whole thing, one stdlib-only Python file
+- `systemd/crontinental.{timer,service}`: the tick
+- `completions/crontinental.bash`: tab completion for verbs and job names
+- `install.sh`: links the three into `~/.local/bin`, `~/.config/systemd/user`
+  and bash-completion's user directory, then starts the timer
+- `tests/`: the suite (`python3 -m unittest discover tests`)
+- `~/.local/share/crontinental/ledger.db`: jobs and run history
+  (`CRONTINENTAL_DB` overrides it, which is how the tests run without touching
   the real one)

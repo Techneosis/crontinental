@@ -1,0 +1,183 @@
+# The Crontinental
+
+*A hotel for commands. Every guest has a reservation, every reservation has a
+checkout, and the house keeps the books.*
+
+The Crontinental runs a command later: once, on a schedule, or until its
+business is finished. Guests survive power cuts and reboots, never double-book
+a room, and are shown out when their stay is over. It was built for a clientele
+of AI agents, who book rooms in the middle of a conversation and leave before
+anyone thinks to ask who is still upstairs.
+
+```
+crontinental in 90m                --name pr-recheck  -- gh pr checks 412
+crontinental at "tomorrow 07:00"   --name thaw        -- ./scripts/thaw-staging
+crontinental every "Mon..Fri 02:00" --name backup --forever -- restic backup ~/work
+crontinental every 10m --name deploy-wait --until-done --until "4 hours" \
+                                         -- 'curl -sf https://example.com/healthz && exit 99'
+```
+
+**Reservations:** Linux with a systemd user manager, and Python 3.10 or newer.
+Nothing to pip-install.
+
+```
+git clone https://github.com/Techneosis/crontinental && cd crontinental
+./install.sh               # links the binary, the units and tab completion; starts the tick
+./install.sh --uninstall   # the reverse (the ledger is kept)
+```
+
+---
+
+## The Rules
+
+The house runs on rules, and none of them bend.
+
+**1. No reservation without a checkout.** A one-night stay (`in`, `at`) checks
+out when it is served. A standing reservation (`every`) must name its
+departure when it is booked, or the front desk turns it away:
+
+| at the desk | the guest leaves |
+|---|---|
+| `--until <time>` | on the date given: `"tomorrow 18:00"`, `"3 days"` |
+| `--until-done` | when they settle the bill themselves, by exiting **99** |
+| `--forever` | never. A permanent resident, on the Management's say-so only |
+
+A guest may hold both of the first two: *"stay until the deploy is live, but
+not past tonight."*
+
+**2. One guest per room.** Each stay gets a room of its own (a transient
+systemd unit), with its own walls (a cgroup), its own logbook (a journal
+stream) and its own time limit. A guest who is still in residence cannot check
+in a second time under the same name. The desk notes the attempt as an
+`overlap` and sends them away.
+
+**3. No guest overstays.** Every stay has a limit, one hour unless arranged
+otherwise (`--timeout 20m`). At the limit the room is cleared, the whole party
+leaves together, and the books record them as `killed`.
+
+**4. The Management is told when there is trouble.** A guest who leaves badly,
+with any exit but 0 or 99, is reported at once: name, exit code, and where to
+read the logbook. `--notify always` reports good departures too.
+`--notify never` is for regulars who come and go every few minutes.
+
+**5. The books are kept.** The register records who made every booking: a
+Claude Code session (from `CLAUDE_CODE_SESSION_ID`), or the user. `list` is a walk down the hall past every
+occupied room.
+
+---
+
+## The Staff
+
+**The Ledger** (`~/.local/share/crontinental/ledger.db`). Every
+reservation and every stay is written here, and nothing else is trusted. The
+building can lose power and the bookings are still on the page in the morning.
+
+**The Concierge** (`crontinental.timer`, every minute). Makes one
+round a minute, the only one on staff with a key to the Ledger's schedule. On
+each round they:
+
+1. send up the cleaners for anyone who left more than three days ago;
+2. show out anyone whose checkout date has arrived;
+3. move each due guest's next reservation along *before* showing them up, so
+   a guest who can't be seated is never re-seated every minute forever;
+4. hand each due guest a room, and return to the desk without waiting to see
+   how the stay goes.
+
+The round takes a few dozen milliseconds. No single guest can hold up the
+Concierge, or the guest behind them.
+
+**The Room Steward** (`crontinental exec`). Sits inside every room
+for the length of the stay, because something must outlast the guest to write
+down how they left: `ok`, `fail`, `killed`, or `done`. When a guest settles up
+with a 99, it is the Steward who closes the reservation.
+
+**The Cleaners.** Three days after a guest checks out, their entry and its
+history are cleared from the Ledger. Until then, `show` and `log` still answer
+questions about the stay. The logbook (the journal) is kept on its own terms,
+after the room itself is long gone.
+
+---
+
+## Booking a Room
+
+Everything after `--` is the guest's business. One argument is a full shell
+line, so pipes, `&&` and `$(…)` all work. Several arguments are taken as an
+argv, quoted properly.
+
+**Wake-up calls.** `in` takes a span (`90m`, `2h`, `1d`). `at` takes anything
+`date -d` reads (`"next friday 18:00"`, `"2026-11-02 09:00"`).
+
+**Standing reservations.** `every` takes systemd's calendar grammar, the same
+one every unit in the building uses (`03:00`, `Mon..Fri 07:30`,
+`*-*-01 09:00`, `hourly`), or a plain interval (`30m`, `4h`). Check a calendar
+spec with `systemd-analyze calendar "<spec>"`.
+
+The house does not accept `daily 03:00`: `daily` already means midnight and
+takes no time. Write `03:00`. Nothing is booked more often than once a minute,
+because that is how often the Concierge comes by.
+
+**Room service.** Every guest is served by a login shell (`bash -lc`) and
+starts in `$HOME` unless `--workdir` says otherwise, so the PATH is the one
+your terminal has, not systemd's bare one. One note on the kitchen: if your
+profile puts mise's shims ahead of nvm and mise has no global node, `node` and
+`npx` refuse to serve. Guests who need node should bring their own (put the one
+they want first on PATH).
+
+---
+
+## Late Arrivals
+
+The building sometimes sleeps (a closed lid, a suspended box). Reservations
+are written in the Ledger, so the first round after waking finds everyone who
+came due, and each guest's `--catchup` decides what happens:
+
+- **`run`**: seat them anyway, late. The default for wake-up calls: a 9:00
+  reminder at 9:40 is still a reminder.
+- **`skip`**: wait for the next reservation. The default for standing
+  bookings: a nightly job that wakes at noon wants tonight, not lunchtime.
+
+A standing guest is always rebooked from *now*. A day asleep costs at most one
+visit, never a queue in the lobby.
+
+---
+
+## At the Front Desk
+
+```
+crontinental list              who is in residence, and when they're next due
+crontinental list --all        including guests checked out and awaiting the cleaners
+crontinental show <name>       one guest's reservation, checkout terms, last 10 stays
+crontinental log <name>        their logbook (-f to keep reading)
+crontinental run <name>        seat them now, without moving their reservation
+crontinental disable <name>    hold the room; a held room is never cleaned
+crontinental enable <name>     release it; a checked-out regular can be re-booked
+crontinental rm <name>         show them out now, mid-stay if need be
+crontinental prune             send the cleaners up early
+```
+
+---
+
+## Why Not Book Elsewhere
+
+`systemd-run --on-calendar` will take a reservation on a napkin. The napkin
+is a transient timer, and transient timers are thrown out with the user
+manager, so "tomorrow at 9" vanishes at the next reboot without a trace. At
+the Crontinental only the *stays* are transient. The reservations are in the
+Ledger, and the Concierge is a permanent member of staff.
+
+---
+
+## The Premises
+
+| | |
+|---|---|
+| `bin/crontinental` | the whole establishment: one Python file, standard library only |
+| `systemd/crontinental.{timer,service}` | the Concierge's rounds |
+| `completions/crontinental.bash` | the bell on the desk (tab completion) |
+| `tests/` | rehearsals: `python3 -m unittest discover tests` |
+| `~/.local/share/crontinental/ledger.db` | the Ledger (`CRONTINENTAL_DB` points the house at another one) |
+
+The building plan, with why each piece is the way it is:
+[docs/design.md](docs/design.md).
+
+MIT licensed.
