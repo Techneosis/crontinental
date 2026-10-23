@@ -35,6 +35,8 @@ crontinental list            what is scheduled, next run, last outcome
 crontinental show <name>     one job in full, with its last 10 runs
 crontinental log <name>      what it printed
 crontinental run <name>      fire it now, without moving its schedule
+crontinental edit <name> …   change it in place: --until, --until-done, --forever,
+                             --every, --timeout, --notify, or a new command after --
 crontinental rm <name>       remove it
 ```
 
@@ -63,6 +65,11 @@ Exit 99 counts as success, not failure.
 A finished job leaves `list` right away and is deleted 3 days later; until
 then `show` and `log` still work. Never schedule a second job to `rm` the
 first. That is what `--until` is for.
+
+To change how an existing job ends, or anything else about it, use `edit`
+rather than `rm` and a fresh booking: edit keeps its history and who created
+it. Naming an end (`--until`, `--until-done`) drops `--forever`, and a repeat
+can't be edited into having no end.
 
 ## The command
 

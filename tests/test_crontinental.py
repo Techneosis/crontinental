@@ -186,6 +186,65 @@ class Checkout(Ledger):
         self.assertIsNotNone(self.job("held"))
 
 
+class Edit(Ledger):
+    def row(self, name, *cols):
+        return self.sql(f"SELECT {', '.join(cols)} FROM job WHERE name=?", name)[0]
+
+    def test_naming_an_end_drops_forever(self):
+        self.cli("every", "1h", "--name", "w", "--forever", "--", "true")
+        self.cli("edit", "w", "--until-done")
+        self.assertEqual(self.row("w", "forever", "until_done"), (0, 1))
+
+    def test_forever_drops_both_ends(self):
+        self.cli("every", "1h", "--name", "w", "--until-done", "--until", "2 hours", "--", "true")
+        self.cli("edit", "w", "--forever")
+        self.assertEqual(self.row("w", "forever", "until_done", "until"), (1, 0, None))
+
+    def test_a_repeat_cannot_be_left_without_an_end(self):
+        self.cli("every", "1h", "--name", "w", "--until-done", "--", "true")
+        p = self.cli("edit", "w", "--no-until-done", ok=False)
+        self.assertIn("without an end", p.stderr)
+        self.assertEqual(self.row("w", "until_done"), (1,), "a refused edit changes nothing")
+
+    def test_dropping_one_of_two_ends_keeps_the_other(self):
+        self.cli("every", "1h", "--name", "w", "--until-done", "--until", "2 hours", "--", "true")
+        self.cli("edit", "w", "--no-until")
+        self.assertEqual(self.row("w", "until", "until_done"), (None, 1))
+
+    def test_new_schedule_recomputes_the_next_run(self):
+        self.cli("every", "1h", "--name", "w", "--forever", "--", "true")
+        before = self.row("w", "next_run")[0]
+        self.cli("edit", "w", "--every", "2h")
+        spec, interval, after = self.row("w", "spec", "interval_sec", "next_run")
+        self.assertEqual((spec, interval), ("2h", 7200))
+        self.assertGreater(after, before)
+        self.cli("edit", "w", "--every", "Mon..Fri 07:30")
+        self.assertEqual(self.row("w", "spec", "interval_sec"), ("Mon..Fri 07:30", None))
+
+    def test_schedule_flags_must_match_the_kind(self):
+        self.cli("every", "1h", "--name", "r", "--forever", "--", "true")
+        self.cli("in", "1h", "--name", "o", "--", "true")
+        self.assertIn("one-off", self.cli("edit", "o", "--every", "2h", ok=False).stderr)
+        self.assertIn("is a repeat", self.cli("edit", "r", "--in", "2h", ok=False).stderr)
+        self.assertIn("ends when it fires", self.cli("edit", "o", "--forever", ok=False).stderr)
+
+    def test_command_and_settings_change_and_history_stays(self):
+        self.cli("every", "1h", "--name", "w", "--forever", "--notify", "never", "--", "true")
+        subprocess.run([BIN, "exec", "w"], env=self.env, capture_output=True)
+        created = self.row("w", "created_at", "created_by")
+        self.cli("edit", "w", "--timeout", "5m", "--notify", "always", "--note", "why",
+                 "--", "echo", "new command")
+        self.assertEqual(self.row("w", "command", "timeout_sec", "notify", "note"),
+                         ("echo 'new command'", 300, "always", "why"))
+        self.assertEqual(self.row("w", "created_at", "created_by"), created)
+        self.assertEqual(self.sql("SELECT count(*) FROM run"), [(1,)])
+
+    def test_edit_without_changes_or_job_is_refused(self):
+        self.cli("every", "1h", "--name", "w", "--forever", "--", "true")
+        self.assertIn("nothing to change", self.cli("edit", "w", ok=False).stderr)
+        self.assertIn("no such job", self.cli("edit", "nope", "--forever", ok=False).stderr)
+
+
 class Migration(Ledger):
     def test_v1_ledger_is_migrated_without_stopping_anything(self):
         with sqlite3.connect(self.db) as c:

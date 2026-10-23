@@ -145,6 +145,7 @@ crontinental list --all    including finished and disabled jobs
 crontinental show <name>   one job in full, with its last 10 runs
 crontinental log <name>    its output, from the journal (-f to follow)
 crontinental run <name>    fire it now WITHOUT moving its schedule
+crontinental edit <name>   change it in place (see below)
 ```
 
 A job's output is never captured into the database — it streams to the journal
@@ -156,6 +157,19 @@ automatically from `CLAUDE_CODE_SESSION_ID` when an agent schedules something,
 so a job nobody remembers can be traced back to the session that wanted it.
 That matters here — this is a persistent execution channel that agents can write
 to, and `list` is the audit of it.
+
+## Changing a job
+
+`edit <name>` changes a job in place, so its run history and `created_by`
+survive. It takes the booking options (not `--name`, which is the unit name, or
+`--by`), plus `--every` for a repeat's schedule, `--at`/`--in` for a one-off's
+time, `--no-until`/`--no-until-done`, and a new command after `--`.
+
+Ends compose: naming an end drops `--forever`, `--forever` drops both ends, and
+the result must still satisfy the booking rule, so a repeat can't be edited
+into having no end. A refused edit changes nothing. A new schedule recomputes
+the next run from now. Enabling and disabling stay with `enable`/`disable`; an
+edit to a finished job says so and leaves it finished.
 
 ## Housekeeping
 

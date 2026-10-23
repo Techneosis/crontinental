@@ -128,6 +128,31 @@ they want first on PATH).
 
 ---
 
+## Changing a Reservation
+
+`edit` changes a booking in place: its stay and checkout, its schedule, its
+business. The guest keeps their history and the register keeps who booked
+them, which a cancellation and a fresh booking would both lose.
+
+```
+crontinental edit deploy-wait --until "tomorrow 18:00"   # extend the stay
+crontinental edit health --until-done                    # leave when the business is done
+crontinental edit backup --every "Mon..Fri 03:00"        # a new standing time
+crontinental edit backup -- restic backup ~/work ~/notes # new business, same room
+```
+
+Checkout terms compose as a guest would mean them: naming a checkout
+(`--until`, `--until-done`) ends permanent residence, and `--forever` makes a
+resident of a guest who had a checkout. `--no-until` and `--no-until-done`
+take one away, but Rule 1 still holds: a standing reservation left with no
+checkout at all is turned away, and the booking stays as it was.
+
+The name on the door does not change (that is the room's name; a new name is
+a new booking), and neither does whether the room is held. That is `disable`
+and `enable`.
+
+---
+
 ## Late Arrivals
 
 The building sometimes sleeps (a closed lid, a suspended box). Reservations
@@ -152,6 +177,7 @@ crontinental list --all        including guests checked out and awaiting the cle
 crontinental show <name>       one guest's reservation, checkout terms, last 10 stays
 crontinental log <name>        their logbook (-f to keep reading)
 crontinental run <name>        seat them now, without moving their reservation
+crontinental edit <name> …     change a reservation, keeping the guest's history
 crontinental disable <name>    hold the room; a held room is never cleaned
 crontinental enable <name>     release it; a checked-out regular can be re-booked
 crontinental rm <name>         show them out now, mid-stay if need be

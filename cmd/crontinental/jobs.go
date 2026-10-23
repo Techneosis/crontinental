@@ -55,32 +55,10 @@ func cmdAdd(o *opts, kind string) {
 	} else {
 		s := o.when
 		spec = &s
-		next, calErr := systemdCalendar(s, nil)
-		if calErr == nil {
-			if next == nil {
-				die("calendar spec %q never elapses", s)
-			}
-			when = *next
-		} else {
-			// systemd's own error for this case suggests the timespan reading,
-			// so `every 30m` means every 30 minutes rather than being rejected.
-			secs, spanErr := systemdTimespan(s)
-			if spanErr != nil {
-				// Report BOTH readings. A spec like "daily 03:00" is an attempt
-				// at a calendar, and showing only the timespan complaint sends
-				// the reader looking in the wrong grammar entirely.
-				die("%q is neither a calendar spec nor an interval.\n"+
-					"  as a calendar: %v\n"+
-					"  as an interval: %v\n"+
-					"  calendar examples: \"03:00\", \"Mon..Fri 07:30\", \"*-*-01 09:00\", \"hourly\"\n"+
-					"  interval examples: 30m, 2h, 1d\n"+
-					"  check one with: systemd-analyze calendar %s", s, calErr, spanErr, shellQuote(s))
-			}
-			if secs < 60 {
-				die("interval %q is shorter than the 1-minute tick", s)
-			}
+		next, iv := parseRepeat(s)
+		when = next
+		if secs, ok := iv.(int64); ok {
 			interval = &secs
-			when = now().Add(time.Duration(secs) * time.Second)
 		}
 		// systemd's own default for a missed timer run is to skip it, and the
 		// same reasoning holds here: a nightly job that wakes at noon usually

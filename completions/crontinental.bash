@@ -17,7 +17,7 @@ _crontinental() {
 
     verb=${COMP_WORDS[1]}
     if ((COMP_CWORD == 1)); then
-        COMPREPLY=($(compgen -W "in at every list show log run rm enable disable prune tick path" -- "$cur"))
+        COMPREPLY=($(compgen -W "in at every list show edit log run rm enable disable prune tick path" -- "$cur"))
         return
     fi
 
@@ -25,7 +25,7 @@ _crontinental() {
         --catchup) COMPREPLY=($(compgen -W "run skip" -- "$cur")); return ;;
         --notify)  COMPREPLY=($(compgen -W "never fail always" -- "$cur")); return ;;
         --workdir) COMPREPLY=($(compgen -d -- "$cur")); return ;;
-        --name|--timeout|--until|--note|--by|--days|-n|--lines) return ;;
+        --name|--timeout|--until|--note|--by|--days|-n|--lines|--every|--at|--in) return ;;
     esac
 
     local IFS=$'\n'
@@ -37,6 +37,12 @@ _crontinental() {
         log)
             if [[ $cur == -* ]]; then
                 COMPREPLY=($(compgen -W $'--lines\n--follow' -- "$cur"))
+            elif ((COMP_CWORD == 2)); then
+                COMPREPLY=($(compgen -W "$(crontinental names 2>/dev/null)" -- "$cur"))
+            fi ;;
+        edit)
+            if [[ $cur == -* ]]; then
+                COMPREPLY=($(compgen -W $'--every\n--at\n--in\n--until\n--no-until\n--until-done\n--no-until-done\n--forever\n--workdir\n--timeout\n--catchup\n--notify\n--note\n--' -- "$cur"))
             elif ((COMP_CWORD == 2)); then
                 COMPREPLY=($(compgen -W "$(crontinental names 2>/dev/null)" -- "$cur"))
             fi ;;

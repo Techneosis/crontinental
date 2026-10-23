@@ -45,6 +45,11 @@ type opts struct {
 	workdir, timeout, catchup, until, notify, note, by string
 	untilDone, forever                                 bool
 
+	// edit
+	every, at, in        string
+	noUntil, noUntilDone bool
+	notifySet, noteSet   bool
+
 	all, json         bool
 	lines             int
 	follow            bool
@@ -74,6 +79,7 @@ verbs:
   rm <name>           remove a job
   enable <name>       resume a disabled job
   disable <name>      stop a job without removing it
+  edit <name> ...     change a job in place, keeping its history (see below)
   prune [--days N]    drop finished jobs now (the tick does it after 3 days)
   path                print the ledger path
 
@@ -89,6 +95,13 @@ options for in/at/every:
   --notify never|fail|always   (default: fail)
   --note TEXT         why this exists
   --by WHO            who scheduled it (default: the Claude session, or $USER)
+
+edit <name> takes any of the options above except --name and --by, plus:
+  --every SPEC        a repeat's new schedule
+  --at TIME, --in SPAN   a one-off's new time
+  --no-until, --no-until-done   drop that end (a repeat must keep one)
+  -- COMMAND          a new command
+Naming an end drops --forever; --forever drops both ends.
 
 A repeat must end: --until <time>, --until-done (the command exits
 99 when finished), or --forever. Finished jobs are deleted after 3 days.
@@ -129,9 +142,23 @@ var verbFlags = map[string]map[string]flagSpec{
 	"log":   {"--lines": {true, nil}, "--follow": {false, nil}},
 	"prune": {"--days": {true, nil}},
 	"tick":  {}, "path": {},
+	"edit":  editFlags,
 	"exec":  {"--due": {true, nil}, "--late": {true, nil}},
 	"names": {"--enabled": {false, nil}, "--disabled": {false, nil}},
 }
+
+var editFlags = func() map[string]flagSpec {
+	m := map[string]flagSpec{
+		"--every": {true, nil}, "--at": {true, nil}, "--in": {true, nil},
+		"--no-until": {false, nil}, "--no-until-done": {false, nil},
+	}
+	for k, v := range addFlags {
+		if k != "--name" && k != "--by" {
+			m[k] = v
+		}
+	}
+	return m
+}()
 
 var shortFlags = map[string]string{"-n": "--lines", "-f": "--follow"}
 
@@ -139,7 +166,7 @@ var shortFlags = map[string]string{"-n": "--lines", "-f": "--follow"}
 var verbArgs = map[string][]string{
 	"in": {"when"}, "at": {"when"}, "every": {"when"},
 	"show": {"name"}, "log": {"name"}, "run": {"name"}, "rm": {"name"},
-	"enable": {"name"}, "disable": {"name"}, "exec": {"name"},
+	"enable": {"name"}, "disable": {"name"}, "exec": {"name"}, "edit": {"name"},
 }
 
 func parse(argv []string) *opts {
@@ -166,7 +193,7 @@ func parse(argv []string) *opts {
 	o.verb = argv[0]
 	flags, ok := verbFlags[o.verb]
 	if !ok {
-		usageErr("", "invalid choice: %q (choose from in, at, every, list, show, log, run, rm, enable, disable, prune, path)", o.verb)
+		usageErr("", "invalid choice: %q (choose from in, at, every, list, show, edit, log, run, rm, enable, disable, prune, path)", o.verb)
 	}
 
 	var pos []string
@@ -234,8 +261,11 @@ func parse(argv []string) *opts {
 	o.workdir, o.timeout, o.catchup = set["--workdir"], set["--timeout"], set["--catchup"]
 	o.until, o.note, o.by, o.due = set["--until"], set["--note"], set["--by"], set["--due"]
 	if v, ok := set["--notify"]; ok {
-		o.notify = v
+		o.notify, o.notifySet = v, true
 	}
+	_, o.noteSet = set["--note"]
+	o.every, o.at, o.in = set["--every"], set["--at"], set["--in"]
+	o.noUntil, o.noUntilDone = bools["--no-until"], bools["--no-until-done"]
 	o.untilDone, o.forever = bools["--until-done"], bools["--forever"]
 	o.all, o.json, o.follow = bools["--all"], bools["--json"], bools["--follow"]
 	o.enabled, o.disabled = bools["--enabled"], bools["--disabled"]
@@ -290,6 +320,8 @@ func main() {
 		cmdToggle(o, true)
 	case "disable":
 		cmdToggle(o, false)
+	case "edit":
+		cmdEdit(o)
 	case "prune":
 		cmdPrune(o)
 	case "tick":
