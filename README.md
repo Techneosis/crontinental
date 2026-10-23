@@ -26,6 +26,9 @@ git clone https://github.com/Techneosis/crontinental && cd crontinental
 ./install.sh --uninstall   # the reverse (the ledger is kept)
 ```
 
+If you use Claude Code, the installer also hands your agents the house
+handbook. See [The Clientele's Handbook](#the-clienteles-handbook).
+
 ---
 
 ## The Rules
@@ -157,6 +160,30 @@ crontinental prune             send the cleaners up early
 
 ---
 
+## The Clientele's Handbook
+
+Most bookings come from AI agents, so the house issues them a handbook: a
+Claude Code skill (`agents/skills/crontinental/`) that teaches an agent when to
+book a room here instead of somewhere that won't last (a session-scoped loop,
+a cloud routine that can't reach this machine, a hand-written cron line), and
+how to book one properly: always by name, with the narrowest checkout that fits
+the request, and never permanent residence unless the guest's host asked for
+it.
+
+When `~/.claude` exists, `install.sh` links the handbook into its `skills/` and
+offers to add a short notice to `CLAUDE.md` pointing agents to it. The notice
+sits between marker comments, so a later install updates it in place and
+`--uninstall` takes it out without disturbing the rest of the file.
+
+```
+./install.sh --claude                    # add the CLAUDE.md notice without asking
+./install.sh --no-claude                 # leave Claude Code alone
+./install.sh --claude-only               # only the handbook and the notice
+./install.sh --uninstall --claude-only   # take both back
+```
+
+---
+
 ## Why Not Book Elsewhere
 
 `systemd-run --on-calendar` will take a reservation on a napkin. The napkin
@@ -174,6 +201,7 @@ Ledger, and the Concierge is a permanent member of staff.
 | `bin/crontinental` | the whole establishment: one Python file, standard library only |
 | `systemd/crontinental.{timer,service}` | the Concierge's rounds |
 | `completions/crontinental.bash` | the bell on the desk (tab completion) |
+| `agents/` | the Clientele's Handbook (a Claude Code skill) and the `CLAUDE.md` notice |
 | `tests/` | rehearsals: `python3 -m unittest discover tests` |
 | `~/.local/share/crontinental/ledger.db` | the Ledger (`CRONTINENTAL_DB` points the house at another one) |
 
