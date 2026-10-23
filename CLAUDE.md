@@ -15,7 +15,9 @@ Claude Code setup.
 | `launchd/` | the tick on macOS (a LaunchAgent; `install.sh` fills in its paths) |
 | `completions/` | bash completion |
 | `agents/` | what ships to users' Claude Code: the skill, and the CLAUDE.md snippet |
-| `install.sh` | links everything into place; `--claude-only` touches only Claude Code |
+| `install.sh` | one script, three modes: piped/downloaded fetches a release, a checkout builds, an unpacked release installs its binary; `--claude-only` touches only Claude Code |
+| `scripts/package.sh` | builds and packages every release target, plus `SHA256SUMS` |
+| `docs/releases/` | release notes, one file per version (optional; otherwise generated) |
 | `tests/` | `python3 -m unittest discover tests` — run before every commit (it builds the binary) |
 | `docs/design.md` | the building plan: why each piece is the way it is |
 
@@ -51,11 +53,6 @@ its CLI (`CRONTINENTAL_BIN` picks which one; unset, they build it). That made
 them the conformance suite when the tool was ported from Python to Go
 (2026-10-23), and it keeps behaviour pinned to the CLI rather than to internals.
 
-## Where it's going
-
-Release binaries per platform (Linux and macOS, amd64 and arm64), so an
-install needs no Go.
-
 ## Two platforms
 
 `platform_linux.go` leans on systemd (transient units, the journal,
@@ -77,3 +74,19 @@ those differential tests passing. `CRONTINENTAL_FUZZ=100000 go test -run Random
 300); it tells systemd's own repeat bugs apart from ours by re-asking with the
 repeats written out as lists. Deliberate differences from the tools are listed
 at the top of each file; anything else that disagrees is a bug here.
+
+## Cutting a release
+
+1. Optionally write `docs/releases/vX.Y.Z.md` (otherwise notes are generated
+   from the commits). Commit it.
+2. `git tag vX.Y.Z && git push origin vX.Y.Z`. A tag with a `-` (`v0.2.0-rc1`)
+   publishes as a prerelease, which the installer's "latest" skips.
+3. `.github/workflows/release.yml` packages all four targets, verifies them on
+   Linux amd64, Linux arm64 and macOS (checksums, the version string, the full
+   conformance suite against the packaged binary, and on macOS the one-liner
+   end to end), and only then publishes. A failed check publishes nothing.
+
+To rehearse without publishing: run the workflow by hand (workflow_dispatch),
+or locally: `scripts/package.sh v0.0.0-test /tmp/rel/latest/download` and
+`CRONTINENTAL_RELEASES=file:///tmp/rel bash -s -- --no-claude < install.sh`
+(with a throwaway `HOME` unless you mean to install it).

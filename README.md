@@ -17,15 +17,34 @@ crontinental every 10m --name deploy-wait --until-done --until "4 hours" \
                                          -- 'curl -sf https://example.com/healthz && exit 99'
 ```
 
-**Reservations:** Linux with a systemd user manager, or macOS. Crontinental is
-one static binary with no runtime; building it from a checkout needs Go
-(`./install.sh --no-build` installs a binary you already have).
+## Checking In
+
+**Reservations:** Linux with a systemd user manager, or macOS (Apple silicon
+or Intel). One static binary, no runtime, nothing else to install.
 
 ```
-git clone https://github.com/Techneosis/crontinental && cd crontinental
-./install.sh               # links the binary and tab completion; starts the tick
-./install.sh --uninstall   # the reverse (the ledger is kept)
+curl -fsSL https://raw.githubusercontent.com/Techneosis/crontinental/main/install.sh | bash
 ```
+
+That fetches the latest release for your machine, checks it against the
+release's SHA-256 sums, and installs it: the binary in `~/.local/bin`, tab
+completion, and the tick (a systemd user timer, or a LaunchAgent on macOS).
+Run it again to upgrade; your bookings carry over. Options go after
+`bash -s --`:
+
+```
+curl -fsSL …/install.sh | bash -s -- --claude          # also brief Claude Code, without asking
+curl -fsSL …/install.sh | bash -s -- --version v0.1.0  # a particular release
+curl -fsSL …/install.sh | bash -s -- --uninstall       # check out (the ledger is kept)
+```
+
+Or download a release archive by hand, unpack it, and run the `install.sh`
+inside. On macOS, a browser download is quarantined; `xattr -dr
+com.apple.quarantine <dir>` clears it (curl downloads aren't).
+
+**From source** (needs Go): `git clone` this repository and run `./install.sh`
+in it. It builds the binary and links everything into the checkout, so edits
+are live.
 
 If you use Claude Code, the installer also hands your agents the house
 handbook. See [The Clientele's Handbook](#the-clienteles-handbook).
@@ -236,11 +255,13 @@ sits between marker comments, so a later install updates it in place and
 `--uninstall` takes it out without disturbing the rest of the file.
 
 ```
-./install.sh --claude                    # add the CLAUDE.md notice without asking
-./install.sh --no-claude                 # leave Claude Code alone
-./install.sh --claude-only               # only the handbook and the notice
-./install.sh --uninstall --claude-only   # take both back
+… | bash -s -- --claude                    # add the CLAUDE.md notice without asking
+… | bash -s -- --no-claude                 # leave Claude Code alone
+… | bash -s -- --claude-only               # only the handbook and the notice
+… | bash -s -- --uninstall --claude-only   # take both back
 ```
+
+(From a checkout, the same options go to `./install.sh`.)
 
 ---
 

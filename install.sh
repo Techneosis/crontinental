@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-# Install Crontinental for the current user, by symlink: edits to this checkout
-# are live, and there is no copy to fall out of date.
+# Install Crontinental for the current user.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Techneosis/crontinental/main/install.sh | bash
+#
+# Run that way (or as a lone downloaded file) it fetches the latest release for
+# this machine, checks its SHA-256, unpacks it into
+# ~/.local/share/crontinental/dist/<version>/, and installs from there; running
+# it again upgrades. Options go after `bash -s --`, e.g. `| bash -s -- --claude`.
+# Run from a checkout, it builds from source instead, and links into the
+# checkout so edits are live.
 #
 #   ./install.sh                link everything, start the tick, set up Claude Code
+#   ./install.sh --version v0.1.0   that release rather than the latest (download only)
 #   ./install.sh --claude       ...and add the CLAUDE.md section without asking
 #   ./install.sh --no-claude    skip Claude Code entirely
 #   ./install.sh --claude-only  only the Claude Code part (no binary, no tick)
@@ -25,7 +34,24 @@
 # Paths are fixed: the tick runs ~/.local/bin/crontinental.
 set -euo pipefail
 
-src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo=Techneosis/crontinental
+releases=${CRONTINENTAL_RELEASES:-https://github.com/$repo/releases}
+data=${XDG_DATA_HOME:-$HOME/.local/share}/crontinental
+
+# Where this script runs from decides what it installs. Piped into bash it has
+# no file at all, and the working directory says nothing about it.
+if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then
+  src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+else
+  src=""
+fi
+if [[ -n $src && -f $src/cmd/crontinental/main.go ]]; then
+  mode=checkout
+elif [[ -n $src && -f $src/VERSION && -x $src/build/crontinental ]]; then
+  mode=release
+else
+  mode=download
+fi
 bin=$HOME/.local/bin
 units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 comp=${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions
@@ -34,22 +60,85 @@ claude=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 BEGIN='<!-- crontinental:begin (managed by crontinental/install.sh; edit agents/claude-md-snippet.md upstream, not here) -->'
 END='<!-- crontinental:end -->'
 
-uninstall=0 claude_only=0 claude_md=ask build=1
+uninstall=0 claude_only=0 claude_md=ask build=1 want_version=latest
+[[ $mode == release ]] && build=0
 os=$(uname -s)
 label=com.techneosis.crontinental
 agent=$HOME/Library/LaunchAgents/$label.plist
 logdir=$HOME/Library/Logs/crontinental
-for arg in "$@"; do
+passthrough=()
+while (($#)); do
+  arg=$1; shift
   case $arg in
+    --version)     want_version=${1:?--version needs a release, e.g. v0.1.0}; shift; continue ;;
+    --version=*)   want_version=${arg#*=}; continue ;;
     --uninstall)   uninstall=1 ;;
     --claude-only) claude_only=1 ;;
     --claude)      claude_md=yes ;;
     --no-claude)   claude_md=never ;;
     --no-build)    build=0 ;;
-    -h|--help)     sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     sed -n '2,36p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null | sed 's/^# \{0,1\}//'
+                   [[ -z $src ]] && echo "see https://github.com/$repo#readme"; exit 0 ;;
     *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
+  passthrough+=("$arg")
 done
+
+# ---------------------------------------------------------------- download
+
+platform() {
+  local o a
+  case $(uname -s) in Linux) o=linux ;; Darwin) o=darwin ;;
+    *) echo "crontinental runs on Linux and macOS, not $(uname -s)" >&2; exit 1 ;; esac
+  case $(uname -m) in x86_64|amd64) a=amd64 ;; aarch64|arm64) a=arm64 ;;
+    *) echo "no crontinental build for $(uname -m)" >&2; exit 1 ;; esac
+  echo "$o-$a"
+}
+
+sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+
+download_and_install() {
+  local plat asset url tmp want got ver
+  plat=$(platform)
+  asset=crontinental-$plat.tar.gz
+  if [[ $want_version == latest ]]; then url=$releases/latest/download; else url=$releases/download/$want_version; fi
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  echo "fetching $asset ($want_version)"
+  curl -fsSL "$url/$asset" -o "$tmp/$asset" || { echo "could not download $url/$asset" >&2; exit 1; }
+  curl -fsSL "$url/SHA256SUMS" -o "$tmp/SHA256SUMS" || { echo "could not download $url/SHA256SUMS" >&2; exit 1; }
+  want=$(awk -v a="$asset" '$2 == a || $2 == "*"a {print $1}' "$tmp/SHA256SUMS")
+  got=$(sha256 "$tmp/$asset")
+  if [[ -z $want || $want != "$got" ]]; then
+    echo "checksum mismatch for $asset: expected ${want:-nothing}, got $got. Not installing." >&2
+    exit 1
+  fi
+  echo "checksum ok"
+  tar -xzf "$tmp/$asset" -C "$tmp"
+  ver=$(cat "$tmp/crontinental-$plat/VERSION")
+  mkdir -p "$data/dist"
+  rm -rf "${data:?}/dist/$ver"
+  mv "$tmp/crontinental-$plat" "$data/dist/$ver"
+  # Everything links through dist/current, so an upgrade is one swapped link.
+  local previous=""
+  [[ -L $data/dist/current ]] && previous=$(readlink "$data/dist/current")
+  ln -sfn "$ver" "$data/dist/current"
+  # Keep this release and the one before it; older ones go.
+  for d in "$data"/dist/*/; do
+    d=$(basename "$d")
+    [[ $d == current || $d == "$ver" || $d == "$previous" ]] || rm -rf "${data:?}/dist/$d"
+  done
+  echo "unpacked $ver into $data/dist/$ver"
+  exec bash "$data/dist/current/install.sh" "${passthrough[@]+"${passthrough[@]}"}"
+}
+
+if [[ $mode == download && $uninstall == 0 ]]; then
+  download_and_install
+fi
+if [[ $mode != download && $want_version != latest ]]; then
+  echo "--version is for downloading a release; this is a $mode install" >&2
+  exit 2
+fi
 
 links=(
   "$src/build/crontinental:$bin/crontinental"
@@ -102,14 +191,18 @@ claude_install() {
   fi
 
   if [[ $claude_md == ask ]]; then
-    if [[ -t 0 ]]; then
+    # Piped from curl, stdin is the script; a person at a terminal still has
+    # /dev/tty, and an unattended run has neither.
+    local from=""
+    if [[ -t 0 ]]; then from=/dev/stdin; elif [[ -t 1 ]] && { : </dev/tty; } 2>/dev/null; then from=/dev/tty; fi
+    if [[ -n $from ]]; then
       echo
       echo "Add a short section to $md so Claude reaches for crontinental"
       echo "(rather than cron, a hand-written timer, or a session-scoped loop)?"
-      read -r -p "[Y/n] " reply
+      read -r -p "[Y/n] " reply <"$from"
       [[ -z $reply || $reply == [Yy]* ]] || { echo "skipped; ./install.sh --claude adds it later"; return 0; }
     else
-      echo "not adding a CLAUDE.md section without asking; ./install.sh --claude adds it"
+      echo "not adding a CLAUDE.md section without asking; run the installer again with --claude to add it"
       return 0
     fi
   fi
@@ -149,7 +242,8 @@ case $uninstall$claude_only in
     done
     [[ $os == Linux ]] && systemctl --user daemon-reload
     claude_uninstall
-    echo "uninstalled; the ledger is left at ${XDG_DATA_HOME:-$HOME/.local/share}/crontinental/"
+    if [[ -d $data/dist ]]; then rm -rf "${data:?}/dist" && echo "removed $data/dist"; fi
+    echo "uninstalled; the ledger is left at $data/"
     exit 0 ;;
 esac
 

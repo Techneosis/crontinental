@@ -84,6 +84,7 @@ verbs:
   prune [--days N]    drop finished jobs now (the tick does it after 3 days)
   check <spec> [-n N] how a spec reads (calendar, interval or time) and when it fires
   path                print the ledger path
+  version             which build this is
 
 options for in/at/every:
   --name NAME         job name; also its systemd unit name
@@ -188,6 +189,10 @@ func parse(argv []string) *opts {
 	}
 	if len(argv) == 0 {
 		usageErr("", "the following arguments are required: verb")
+	}
+	if argv[0] == "--version" || argv[0] == "version" {
+		fmt.Println(versionString())
+		os.Exit(0)
 	}
 	if argv[0] == "-h" || argv[0] == "--help" || argv[0] == "help" {
 		fmt.Print(usage)
