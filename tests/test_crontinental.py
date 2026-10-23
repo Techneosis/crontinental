@@ -93,6 +93,18 @@ class Booking(Ledger):
         self.assertEqual(self.job("b")[4], 1)
         self.assertEqual(self.job("c")[3], 1)
 
+    def test_calendar_specs_work_in_and_out_of_utc(self):
+        # systemd words its answer differently when local time is UTC; a parser
+        # that only read one wording reported every spec as "never elapses".
+        for tz in ("UTC", "America/New_York", "Asia/Kolkata"):
+            with self.subTest(tz=tz):
+                self.env["TZ"] = tz
+                name = "cal-" + tz.lower().replace("/", "-")
+                self.cli("every", "Mon..Fri 07:30", "--name", name, "--forever", "--", "true")
+                (nxt,), = self.sql("SELECT next_run FROM job WHERE name=?", name)
+                gap = datetime.fromisoformat(nxt) - datetime.now(timezone.utc)
+                self.assertTrue(timedelta(0) < gap <= timedelta(days=4), (tz, nxt))
+
     def test_daily_with_a_time_explains_both_grammars(self):
         p = self.cli("every", "daily 03:00", "--name", "x", "--forever", "--", "true", ok=False)
         self.assertIn("as a calendar", p.stderr)

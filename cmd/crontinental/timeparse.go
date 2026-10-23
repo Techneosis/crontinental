@@ -15,9 +15,12 @@ import (
 // separate step, checked against these tools.
 
 var (
-	neverRe    = regexp.MustCompile(`Next elapse:\s*never`)
-	nextUTCRe  = regexp.MustCompile(`\(in UTC\):\s*\w{3} (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC`)
-	timespanRe = regexp.MustCompile(`(?:μs|us):\s*(\d+)`)
+	neverRe = regexp.MustCompile(`Next elapse:\s*never`)
+	// systemd prints "(in UTC):" only when local time isn't UTC. On a UTC
+	// machine (most servers, every CI runner) "Next elapse:" already is UTC.
+	nextUTCRe    = regexp.MustCompile(`\(in UTC\):\s*\w{3} (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC`)
+	nextElapseRe = regexp.MustCompile(`Next elapse:\s*\w{3} (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC`)
+	timespanRe   = regexp.MustCompile(`(?:μs|us):\s*(\d+)`)
 )
 
 func firstLine(b []byte, fallback string) string {
@@ -56,11 +59,16 @@ func systemdCalendar(spec string, after *time.Time) (*time.Time, error) {
 	}
 	m := nextUTCRe.FindSubmatch(out)
 	if m == nil {
-		return nil, nil
+		m = nextElapseRe.FindSubmatch(out)
+	}
+	// Unreadable output is an error, never "no next run": reporting a spec as
+	// never elapsing is how this used to fail on UTC machines.
+	if m == nil {
+		return nil, errors.New("could not read systemd-analyze's answer: " + firstLine(out, "(empty)"))
 	}
 	t, err := time.Parse("2006-01-02 15:04:05", string(m[1]))
 	if err != nil {
-		return nil, nil
+		return nil, errors.New("could not read systemd-analyze's answer: " + string(m[1]))
 	}
 	return &t, nil
 }
