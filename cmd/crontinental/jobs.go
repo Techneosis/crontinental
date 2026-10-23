@@ -42,7 +42,7 @@ func cmdAdd(o *opts, kind string) {
 		if o.verb == "at" {
 			when = parseWhen(o.when)
 		} else {
-			secs, err := systemdTimespan(o.when)
+			secs, err := parseTimespan(o.when)
 			if err != nil {
 				die("%q is not a delay: %v (try 90m, 2h, 1d)", o.when, err)
 			}
@@ -99,7 +99,7 @@ func cmdAdd(o *opts, kind string) {
 
 	timeout := int64(defaultTimeoutSec)
 	if o.timeout != "" {
-		secs, err := systemdTimespan(o.timeout)
+		secs, err := parseTimespan(o.timeout)
 		if err != nil {
 			die("%q is not a timeout: %v", o.timeout, err)
 		}

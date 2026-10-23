@@ -51,7 +51,16 @@ them the conformance suite when the tool was ported from Python to Go
 
 ## Where it's going
 
-macOS support (launchd for the tick, a process group per run, file logs) needs
-the schedule grammars in Go first: today calendar specs and timespans go
-through `systemd-analyze`, and times through GNU `date -d`. Then release
-binaries per platform.
+macOS support (launchd for the tick, a process group per run, file logs), then
+release binaries per platform.
+
+## The grammars are held to the real tools
+
+`calendar.go`, `timespan.go` and `when.go` are native, and `go test ./...`
+checks them against `systemd-analyze` and GNU `date` wherever those exist
+(they skip elsewhere; fixed-answer tests run everywhere). A grammar change keeps
+those differential tests passing. `CRONTINENTAL_FUZZ=100000 go test -run Random
+./cmd/crontinental/` runs the random calendar comparison at full size (CI runs
+300); it tells systemd's own repeat bugs apart from ours by re-asking with the
+repeats written out as lists. Deliberate differences from the tools are listed
+at the top of each file; anything else that disagrees is a bug here.

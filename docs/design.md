@@ -57,13 +57,31 @@ the node you want first on PATH), not with a global default.
 
 ## Schedules
 
-`at` takes anything `date -d` understands (`"2026-09-15 09:00"`, `"tomorrow
-07:00"`, `"next friday 18:00"`). `in` takes a systemd timespan (`90m`, `2h`,
-`1d`).
+`crontinental check "<spec>"` says how any spec reads (calendar, interval or
+time) and when it would fire next.
 
-`every` takes systemd's own calendar grammar, parsed by `systemd-analyze` rather
-than a hand-rolled cron parser — so it is the same grammar as every unit on this
-box, and `systemd-analyze calendar "<spec>"` is the way to check one:
+`in` takes a systemd time span (`90m`, `2h 30min`, `1.5h`, `1d`; case matters,
+`M` is a month and `m` a minute).
+
+`at` and `--until` take a time as a person types it: `2026-09-15 09:00`,
+`2026-09-15T09:00`, `9/15/2026`, `Oct 24 2026 10:00`, `24 Oct`, `07:00`,
+`7:30pm`, `7 pm`, `today`, `tomorrow 07:00`, `friday 18:00`, `next friday`,
+`last monday`, `3 days`, `2 hours ago`, `1 day 2 hours`, `fortnight`,
+`10:00 UTC`, `@<epoch>`, in any order. It is a subset of GNU `date -d`, with two
+deliberate differences: days, weeks, months and years keep the wall-clock time
+across a daylight-saving change (GNU keeps the UTC offset), and a date with a
+weekday ("2026-09-15 friday") is refused rather than silently dropping the
+weekday.
+
+`every` takes systemd's own calendar grammar, so it is the same grammar as
+every systemd timer. Crontinental parses it itself (one implementation on every
+platform, macOS included), and the tests hold that parser to `systemd-analyze`:
+a hand-written corpus across five time zones and both daylight-saving changes,
+and a hundred thousand random specs. Where the two disagreed, every remaining
+case turned out to be a systemd bug in repeats ("01/13:00" skips 01:00 after a
+day boundary, though "01,14:00" doesn't), which the tests detect and log. One
+omission: fractional seconds (`12:30:15.5`) are refused; the tick runs once a
+minute.
 
 ```
 03:00               daily at 3am
@@ -86,7 +104,7 @@ created, or it is refused:
 
 | flag | ends |
 |---|---|
-| `--until <time>` | at a deadline — anything `date -d` reads (`"tomorrow 18:00"`, `"3 days"`) |
+| `--until <time>` | at a deadline (`"tomorrow 18:00"`, `"3 days"`; see Schedules) |
 | `--until-done` | when the command exits **99**: the job itself decides its work is finished |
 | `--forever` | never — the only way to get a permanent job, so it is always a choice |
 

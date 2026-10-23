@@ -188,6 +188,14 @@ func notify(headline, body string, critical bool) {
 	_ = exec.CommandContext(ctx, argv[0], argv[1:]...).Run() // a missing notifier must never fail a job
 }
 
+func runTool(name string, args ...string) (stdout, stderr []byte, err error) {
+	cmd := exec.Command(name, args...)
+	var out, errb strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err = cmd.Run()
+	return []byte(out.String()), []byte(errb.String()), err
+}
+
 // joinCommand: one argument after `--` is a shell line, verbatim, so pipes and
 // && survive. Several are an argv, quoted safely. Both end up as a string for
 // the login shell.

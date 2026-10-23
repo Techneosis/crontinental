@@ -47,7 +47,7 @@ func cmdEdit(o *opts) {
 		if o.at != "" {
 			when = parseWhen(o.at)
 		} else {
-			secs, err := systemdTimespan(o.in)
+			secs, err := parseTimespan(o.in)
 			if err != nil {
 				die("%q is not a delay: %v (try 90m, 2h, 1d)", o.in, err)
 			}
@@ -113,7 +113,7 @@ func cmdEdit(o *opts) {
 
 	// --- the rest
 	if o.timeout != "" {
-		secs, err := systemdTimespan(o.timeout)
+		secs, err := parseTimespan(o.timeout)
 		if err != nil {
 			die("%q is not a timeout: %v", o.timeout, err)
 		}
@@ -174,21 +174,21 @@ func cmdEdit(o *opts) {
 // parseRepeat reads an `every` spec: a calendar first, then an interval,
 // refusing anything else with both readings explained.
 func parseRepeat(s string) (time.Time, any) {
-	next, calErr := systemdCalendar(s, nil)
+	next, calErr := calendarNext(s, nil)
 	if calErr == nil {
 		if next == nil {
 			die("calendar spec %q never elapses", s)
 		}
 		return *next, nil
 	}
-	secs, spanErr := systemdTimespan(s)
+	secs, spanErr := parseTimespan(s)
 	if spanErr != nil {
 		die("%q is neither a calendar spec nor an interval.\n"+
 			"  as a calendar: %v\n"+
 			"  as an interval: %v\n"+
 			"  calendar examples: \"03:00\", \"Mon..Fri 07:30\", \"*-*-01 09:00\", \"hourly\"\n"+
 			"  interval examples: 30m, 2h, 1d\n"+
-			"  check one with: systemd-analyze calendar %s", s, calErr, spanErr, shellQuote(s))
+			"  check one with: crontinental check %s", s, calErr, spanErr, shellQuote(s))
 	}
 	if secs < 60 {
 		die("interval %q is shorter than the 1-minute tick", s)

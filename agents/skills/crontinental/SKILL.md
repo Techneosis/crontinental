@@ -83,7 +83,8 @@ they don't hurt.
 ## Schedules
 
 `in` takes a timespan (`90m`, `2h`, `1d`). `at` takes a date and time
-(`"tomorrow 07:00"`, `"2026-09-15 09:00"`, `"next friday 18:00"`).
+(`"tomorrow 07:00"`, `"2026-09-15 09:00"`, `"next friday 18:00"`, `"3 days"`,
+`"7pm"`, `"Oct 24 10:00"`).
 
 `every` takes systemd's calendar grammar or a plain interval:
 
@@ -94,8 +95,10 @@ Mon..Fri 07:30   weekday mornings    4h     every 4 hours
 ```
 
 **`daily 03:00` is invalid**: `daily` already means midnight and takes no time.
-Write `03:00`. Check a calendar spec with `systemd-analyze calendar "<spec>"`.
-Nothing runs more often than once a minute; that is the tick.
+Write `03:00`. **Check any spec before booking it** with
+`crontinental check "<spec>"`: it says whether it reads as a calendar, an
+interval or a time, and when it next fires. Nothing runs more often than once a
+minute; that is the tick.
 
 ## Things that will otherwise surprise you
 

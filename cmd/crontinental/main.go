@@ -54,6 +54,7 @@ type opts struct {
 	lines             int
 	follow            bool
 	enabled, disabled bool
+	count             int
 	days              int
 	due               string
 	late              int64
@@ -81,6 +82,7 @@ verbs:
   disable <name>      stop a job without removing it
   edit <name> ...     change a job in place, keeping its history (see below)
   prune [--days N]    drop finished jobs now (the tick does it after 3 days)
+  check <spec> [-n N] how a spec reads (calendar, interval or time) and when it fires
   path                print the ledger path
 
 options for in/at/every:
@@ -89,7 +91,7 @@ options for in/at/every:
   --timeout SPAN      kill the run after this long (default 1h)
   --catchup run|skip  a fire more than 120s late: run it anyway, or skip to the
                       next one (default: run for one-offs, skip for repeats)
-  --until TIME        a repeat ends at this time (anything ` + "`date -d`" + ` reads)
+  --until TIME        a repeat ends at this time ("tomorrow 18:00", "3 days")
   --until-done        a repeat ends when the command exits 99
   --forever           a repeat that never ends; required when no end is given
   --notify never|fail|always   (default: fail)
@@ -143,6 +145,7 @@ var verbFlags = map[string]map[string]flagSpec{
 	"prune": {"--days": {true, nil}},
 	"tick":  {}, "path": {},
 	"edit":  editFlags,
+	"check": {"--count": {true, nil}, "--lines": {true, nil}},
 	"exec":  {"--due": {true, nil}, "--late": {true, nil}},
 	"names": {"--enabled": {false, nil}, "--disabled": {false, nil}},
 }
@@ -164,7 +167,7 @@ var shortFlags = map[string]string{"-n": "--lines", "-f": "--follow"}
 
 // positionals each verb needs, by name
 var verbArgs = map[string][]string{
-	"in": {"when"}, "at": {"when"}, "every": {"when"},
+	"in": {"when"}, "at": {"when"}, "every": {"when"}, "check": {"when"},
 	"show": {"name"}, "log": {"name"}, "run": {"name"}, "rm": {"name"},
 	"enable": {"name"}, "disable": {"name"}, "exec": {"name"}, "edit": {"name"},
 }
@@ -193,7 +196,7 @@ func parse(argv []string) *opts {
 	o.verb = argv[0]
 	flags, ok := verbFlags[o.verb]
 	if !ok {
-		usageErr("", "invalid choice: %q (choose from in, at, every, list, show, edit, log, run, rm, enable, disable, prune, path)", o.verb)
+		usageErr("", "invalid choice: %q (choose from in, at, every, list, show, edit, log, run, rm, enable, disable, prune, check, path)", o.verb)
 	}
 
 	var pos []string
@@ -274,6 +277,12 @@ func parse(argv []string) *opts {
 	}
 	o.lines = intFlag(o.verb, set, "--lines", 50)
 	o.days = intFlag(o.verb, set, "--days", 0)
+	o.count = intFlag(o.verb, set, "--count", 3)
+	if o.verb == "check" {
+		if v, ok := set["--lines"]; ok { // -n reads naturally here too
+			o.count = intFlag(o.verb, map[string]string{"--count": v}, "--count", 3)
+		}
+	}
 	o.late = int64(intFlag(o.verb, set, "--late", 0))
 	return o
 }
@@ -330,6 +339,8 @@ func main() {
 		cmdExec(o)
 	case "names":
 		cmdNames(o)
+	case "check":
+		cmdCheck(o)
 	case "path":
 		fmt.Println(dbPath())
 	}

@@ -107,13 +107,26 @@ Everything after `--` is the guest's business. One argument is a full shell
 line, so pipes, `&&` and `$(…)` all work. Several arguments are taken as an
 argv, quoted properly.
 
-**Wake-up calls.** `in` takes a span (`90m`, `2h`, `1d`). `at` takes anything
-`date -d` reads (`"next friday 18:00"`, `"2026-11-02 09:00"`).
+**Wake-up calls.** `in` takes a span (`90m`, `2h 30min`, `1d`). `at` takes a
+time the way a guest would say it: `"next friday 18:00"`, `"tomorrow 7am"`,
+`"2026-11-02 09:00"`, `"Oct 24 10:00"`, `"3 days"`.
 
 **Standing reservations.** `every` takes systemd's calendar grammar, the same
-one every unit in the building uses (`03:00`, `Mon..Fri 07:30`,
-`*-*-01 09:00`, `hourly`), or a plain interval (`30m`, `4h`). Check a calendar
-spec with `systemd-analyze calendar "<spec>"`.
+one every systemd timer uses (`03:00`, `Mon..Fri 07:30`, `*-*-01 09:00`,
+`hourly`), or a plain interval (`30m`, `4h`). The house reads it with its own
+clerk, so it means the same thing in every building, and the clerk is held to
+systemd's answers on a hundred thousand bookings.
+
+**Asking the desk.** `crontinental check "<spec>"` says how the house reads a
+spec, and when it would next come round:
+
+```
+$ crontinental check "Mon..Fri 07:30"
+calendar    Mon..Fri *-*-* 07:30:00
+next        Mon 10-26 07:30 (in 3d)
+            Tue 10-27 07:30 (in 4d)
+            Wed 10-28 07:30 (in 5d)
+```
 
 The house does not accept `daily 03:00`: `daily` already means midnight and
 takes no time. Write `03:00`. Nothing is booked more often than once a minute,
