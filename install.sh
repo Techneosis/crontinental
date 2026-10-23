@@ -41,7 +41,7 @@ for arg in "$@"; do
 done
 
 links=(
-  "$src/bin/crontinental:$bin/crontinental"
+  "$src/build/crontinental:$bin/crontinental"
   "$src/systemd/crontinental.service:$units/crontinental.service"
   "$src/systemd/crontinental.timer:$units/crontinental.timer"
   "$src/completions/crontinental.bash:$comp/crontinental"
@@ -133,10 +133,16 @@ case $uninstall$claude_only in
     exit 0 ;;
 esac
 
-python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
-  || { echo "crontinental needs Python 3.10 or newer" >&2; exit 1; }
+command -v go >/dev/null \
+  || { echo "building crontinental from a checkout needs Go (https://go.dev/dl/)" >&2; exit 1; }
 command -v systemd-analyze >/dev/null && systemctl --user show-environment >/dev/null 2>&1 \
   || { echo "crontinental needs a running systemd user manager" >&2; exit 1; }
+
+# Build to a temp name and rename into place: a tick that starts mid-build
+# then runs the old binary or the new one, never half of one.
+(cd "$src" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o build/crontinental.new ./cmd/crontinental)
+mv -f "$src/build/crontinental.new" "$src/build/crontinental"
+echo "built $src/build/crontinental"
 
 for pair in "${links[@]}"; do
   link "${pair%%:*}" "${pair#*:}"

@@ -3,12 +3,15 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.10", "3.13"]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -v tests
+          python-version: "3.13"
+      - run: go vet ./...
+      - run: CGO_ENABLED=0 go build -trimpath -o build/crontinental ./cmd/crontinental
+      # The suite is black-box: it runs the built binary through its CLI.
+      - run: CRONTINENTAL_BIN=$PWD/build/crontinental python -m unittest discover -v tests

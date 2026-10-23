@@ -2,7 +2,7 @@
 
 Nothing here touches systemd: runs are driven through `exec` directly (what a
 job's own unit would call), and `tick` is only exercised on paths that finish or
-reap jobs rather than dispatching them. So the suite runs anywhere Python and
+reap jobs rather than dispatching them. So the suite runs anywhere Python, Go and
 `systemd-analyze` do.
 
     python3 -m unittest discover tests
@@ -16,7 +16,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-BIN = str(Path(__file__).resolve().parent.parent / "bin" / "crontinental")
+from _binary import BIN
 
 V1_SCHEMA = """
 CREATE TABLE job (

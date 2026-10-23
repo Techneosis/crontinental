@@ -9,12 +9,12 @@ Claude Code setup.
 
 | path | what |
 |---|---|
-| `bin/crontinental` | the whole tool: one Python file, standard library only |
+| `cmd/crontinental/` | the whole tool, in Go: one static binary (`CGO_ENABLED=0`) |
 | `systemd/` | the tick (`crontinental.{timer,service}`) |
 | `completions/` | bash completion |
 | `agents/` | what ships to users' Claude Code: the skill, and the CLAUDE.md snippet |
 | `install.sh` | links everything into place; `--claude-only` touches only Claude Code |
-| `tests/` | `python3 -m unittest discover tests` — run before every commit |
+| `tests/` | `python3 -m unittest discover tests` — run before every commit (it builds the binary) |
 | `docs/design.md` | the building plan: why each piece is the way it is |
 
 ## Rules
@@ -23,10 +23,11 @@ Claude Code setup.
   (`CRONTINENTAL_DB`) and a throwaway Claude config (`CLAUDE_CONFIG_DIR`), so
   they never touch the machine's own jobs. A behaviour change comes with a test
   that fails without it.
-- **No dependencies outside the standard library.** The tool has to install by
-  symlink, with nothing to pip-install.
+- **One static binary, no runtime.** Go's standard library plus
+  `modernc.org/sqlite` (pure Go, so cross-compiling needs no C toolchain). A
+  new dependency has to keep `CGO_ENABLED=0` builds working for every target.
 - **The ledger schema is a contract.** Existing ledgers must keep working: a
-  schema change bumps `SCHEMA_VERSION` and ships a migration that is tested
+  schema change bumps `schemaVersion` (`ledger.go`) and ships a migration that is tested
   against the previous version's schema (see `Migration` in the tests).
 - **Keep the invariants in the tick:** advance a job's schedule *before*
   dispatching it (a failed launch must not retry every minute), and never reap a
@@ -41,10 +42,16 @@ Claude Code setup.
 - **Commit messages carry no AI attribution**: no `Co-Authored-By`,
   `Claude-Session` or "Generated with" lines.
 
+## The test suite is the spec
+
+The tests are Python on purpose and black-box: they drive the binary through
+its CLI (`CRONTINENTAL_BIN` picks which one; unset, they build it). That made
+them the conformance suite when the tool was ported from Python to Go
+(2026-10-23), and it keeps behaviour pinned to the CLI rather than to internals.
+
 ## Where it's going
 
-A rewrite in Go is planned, for a single static binary per platform and macOS
-support (launchd for the tick, a process group per run, file logs). Until it
-lands, this Python version is the reference implementation: the test suite is
-black-box on purpose, so it can be pointed at the Go binary and serve as the
-conformance suite.
+macOS support (launchd for the tick, a process group per run, file logs) needs
+the schedule grammars in Go first: today calendar specs and timespans go
+through `systemd-analyze`, and times through GNU `date -d`. Then release
+binaries per platform.

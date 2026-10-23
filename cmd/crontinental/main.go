@@ -1,0 +1,304 @@
+// Crontinental runs a command later, once or on a repeat, without creating a
+// systemd unit for it.
+//
+// Design, and why it is split this way:
+//
+// DURABILITY lives in the ledger (SQLite), not in systemd. `systemd-run
+// --on-calendar` can schedule a command with no files at all, but the transient
+// timer it creates dies with the user manager -- so "run this tomorrow at
+// 09:00" silently evaporates at the next reboot. A row survives.
+//
+// THE HEARTBEAT is one timer (crontinental.timer, 1/min) shared by every job,
+// so adding work never means adding a unit, a daemon-reload, or an enable.
+// That is the entire point: agents schedule things, and agent-written unit
+// files would otherwise pile up in ~/.config/systemd/user, unowned.
+//
+// EXECUTION is a transient unit per run, via systemd-run. Each job therefore
+// gets its own cgroup, its own journal stream (`journalctl --user -u
+// crontinental-job-<name>`), and its own RuntimeMaxSec -- none of which a tick
+// that ran jobs inline could give it, and any one of which a wedged job would
+// otherwise take from every other job. The tick only ever spawns and returns,
+// so it stays sub-second no matter what it launched.
+//
+// EVERY JOB ENDS, and then it goes away. A one-off ends when it fires. A repeat
+// has to say how it ends when it is created -- `--until <time>`,
+// `--until-done` (the command exits 99 when its work is finished), or
+// `--forever` -- and is refused otherwise, so a job that runs forever is a
+// choice someone made rather than an agent forgetting to clean up. A finished
+// job leaves `list` at once and the tick deletes it retainSec later; until then
+// `show` and `log` still work.
+package main
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+type opts struct {
+	verb    string
+	when    string
+	name    string
+	command []string
+
+	workdir, timeout, catchup, until, notify, note, by string
+	untilDone, forever                                 bool
+
+	all, json         bool
+	lines             int
+	follow            bool
+	enabled, disabled bool
+	days              int
+	due               string
+	late              int64
+}
+
+const usage = `usage: crontinental <verb> ...
+
+Run a command later, once or on a repeat, without creating a systemd unit for it.
+
+  crontinental in 90m               --name pr-recheck -- gh pr checks 412
+  crontinental at "tomorrow 09:00"  --name thaw -- ./scripts/thaw-staging
+  crontinental every "Mon..Fri 02:00" --name backup --forever -- restic backup ~/work
+  crontinental every 30m --name watch --until "2 hours" -- 'curl -sf https://x/health || exit 1'
+
+verbs:
+  in <delay>          run once, after a delay (90m, 2h, 1d)
+  at <time>           run once, at a time ("2026-09-15 09:00", "tomorrow 07:00")
+  every <spec>        repeat: a calendar spec ("Mon..Fri 07:30", "hourly") or an interval ("30m")
+  list [--all] [--json]   what is scheduled
+  show <name>         one job, in full, with its recent runs
+  log <name> [-n N] [-f]  the job's output, from the journal
+  run <name>          fire it now, without moving its schedule
+  rm <name>           remove a job
+  enable <name>       resume a disabled job
+  disable <name>      stop a job without removing it
+  prune [--days N]    drop finished jobs now (the tick does it after 3 days)
+  path                print the ledger path
+
+options for in/at/every:
+  --name NAME         job name; also its systemd unit name
+  --workdir DIR       run here (default: $HOME)
+  --timeout SPAN      kill the run after this long (default 1h)
+  --catchup run|skip  a fire more than 120s late: run it anyway, or skip to the
+                      next one (default: run for one-offs, skip for repeats)
+  --until TIME        a repeat ends at this time (anything ` + "`date -d`" + ` reads)
+  --until-done        a repeat ends when the command exits 99
+  --forever           a repeat that never ends; required when no end is given
+  --notify never|fail|always   (default: fail)
+  --note TEXT         why this exists
+  --by WHO            who scheduled it (default: the Claude session, or $USER)
+
+A repeat must end: --until <time>, --until-done (the command exits
+99 when finished), or --forever. Finished jobs are deleted after 3 days.
+
+Everything after ` + "`--`" + ` is the command. One argument is taken as a
+shell line (pipes and && work); several are taken as an argv.
+Every job runs under ` + "`bash -lc`" + `, so node/mise/~/.local/bin are on
+PATH exactly as they are in a terminal.
+`
+
+// usageErr is argparse's behaviour for a malformed command line: exit 2.
+func usageErr(verb, format string, args ...any) {
+	prog := "crontinental"
+	if verb != "" {
+		prog += " " + verb
+	}
+	fmt.Fprintf(os.Stderr, "usage: %s ... (crontinental --help)\n%s: error: %s\n", prog, prog, fmt.Sprintf(format, args...))
+	os.Exit(2)
+}
+
+type flagSpec struct {
+	takesValue bool
+	choices    []string
+}
+
+var addFlags = map[string]flagSpec{
+	"--name": {true, nil}, "--workdir": {true, nil}, "--timeout": {true, nil},
+	"--catchup": {true, []string{"run", "skip"}}, "--until": {true, nil},
+	"--until-done": {false, nil}, "--forever": {false, nil},
+	"--notify": {true, []string{"never", "fail", "always"}},
+	"--note":   {true, nil}, "--by": {true, nil},
+}
+
+var verbFlags = map[string]map[string]flagSpec{
+	"in": addFlags, "at": addFlags, "every": addFlags,
+	"list": {"--all": {false, nil}, "--json": {false, nil}},
+	"show": {}, "run": {}, "rm": {}, "enable": {}, "disable": {},
+	"log":   {"--lines": {true, nil}, "--follow": {false, nil}},
+	"prune": {"--days": {true, nil}},
+	"tick":  {}, "path": {},
+	"exec":  {"--due": {true, nil}, "--late": {true, nil}},
+	"names": {"--enabled": {false, nil}, "--disabled": {false, nil}},
+}
+
+var shortFlags = map[string]string{"-n": "--lines", "-f": "--follow"}
+
+// positionals each verb needs, by name
+var verbArgs = map[string][]string{
+	"in": {"when"}, "at": {"when"}, "every": {"when"},
+	"show": {"name"}, "log": {"name"}, "run": {"name"}, "rm": {"name"},
+	"enable": {"name"}, "disable": {"name"}, "exec": {"name"},
+}
+
+func parse(argv []string) *opts {
+	o := &opts{notify: "fail", lines: 50}
+	// Split the command off BEFORE parsing. Collecting "the rest" from the first
+	// positional onward would swallow --name and friends along with it;
+	// splitting on the first literal `--` keeps the option/command boundary
+	// exactly where the user typed it, and leaves any further `--` inside the
+	// command untouched.
+	for i, a := range argv {
+		if a == "--" {
+			o.command = argv[i+1:]
+			argv = argv[:i]
+			break
+		}
+	}
+	if len(argv) == 0 {
+		usageErr("", "the following arguments are required: verb")
+	}
+	if argv[0] == "-h" || argv[0] == "--help" || argv[0] == "help" {
+		fmt.Print(usage)
+		os.Exit(0)
+	}
+	o.verb = argv[0]
+	flags, ok := verbFlags[o.verb]
+	if !ok {
+		usageErr("", "invalid choice: %q (choose from in, at, every, list, show, log, run, rm, enable, disable, prune, path)", o.verb)
+	}
+
+	var pos []string
+	set := map[string]string{}
+	bools := map[string]bool{}
+	rest := argv[1:]
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		if a == "-h" || a == "--help" {
+			fmt.Print(usage)
+			os.Exit(0)
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			pos = append(pos, a)
+			continue
+		}
+		key, val, hasVal := strings.Cut(a, "=")
+		if long, ok := shortFlags[key]; ok {
+			key = long
+		}
+		spec, ok := flags[key]
+		if !ok {
+			usageErr(o.verb, "unrecognized arguments: %s", a)
+		}
+		if !spec.takesValue {
+			if hasVal {
+				usageErr(o.verb, "argument %s: ignored explicit argument %q", key, val)
+			}
+			bools[key] = true
+			continue
+		}
+		if !hasVal {
+			if i+1 >= len(rest) {
+				usageErr(o.verb, "argument %s: expected one argument", key)
+			}
+			i++
+			val = rest[i]
+		}
+		if spec.choices != nil && !contains(spec.choices, val) {
+			usageErr(o.verb, "argument %s: invalid choice: %q (choose from %s)", key, val,
+				"'"+strings.Join(spec.choices, "', '")+"'")
+		}
+		set[key] = val
+	}
+
+	want := verbArgs[o.verb]
+	if len(pos) < len(want) {
+		usageErr(o.verb, "the following arguments are required: %s", strings.Join(want[len(pos):], ", "))
+	}
+	if len(pos) > len(want) {
+		usageErr(o.verb, "unrecognized arguments: %s", strings.Join(pos[len(want):], " "))
+	}
+	for i, w := range want {
+		switch w {
+		case "when":
+			o.when = pos[i]
+		case "name":
+			o.name = pos[i]
+		}
+	}
+
+	if v, ok := set["--name"]; ok {
+		o.name = v
+	}
+	o.workdir, o.timeout, o.catchup = set["--workdir"], set["--timeout"], set["--catchup"]
+	o.until, o.note, o.by, o.due = set["--until"], set["--note"], set["--by"], set["--due"]
+	if v, ok := set["--notify"]; ok {
+		o.notify = v
+	}
+	o.untilDone, o.forever = bools["--until-done"], bools["--forever"]
+	o.all, o.json, o.follow = bools["--all"], bools["--json"], bools["--follow"]
+	o.enabled, o.disabled = bools["--enabled"], bools["--disabled"]
+	if o.enabled && o.disabled {
+		usageErr(o.verb, "argument --disabled: not allowed with argument --enabled")
+	}
+	o.lines = intFlag(o.verb, set, "--lines", 50)
+	o.days = intFlag(o.verb, set, "--days", 0)
+	o.late = int64(intFlag(o.verb, set, "--late", 0))
+	return o
+}
+
+func intFlag(verb string, set map[string]string, key string, dflt int) int {
+	v, ok := set[key]
+	if !ok {
+		return dflt
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		usageErr(verb, "argument %s: invalid int value: %q", key, v)
+	}
+	return n
+}
+
+func contains(xs []string, x string) bool {
+	for _, y := range xs {
+		if y == x {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	o := parse(os.Args[1:])
+	switch o.verb {
+	case "in", "at":
+		cmdAdd(o, "once")
+	case "every":
+		cmdAdd(o, "repeat")
+	case "list":
+		cmdList(o)
+	case "show":
+		cmdShow(o)
+	case "log":
+		cmdLog(o)
+	case "run":
+		cmdRun(o)
+	case "rm":
+		cmdRm(o)
+	case "enable":
+		cmdToggle(o, true)
+	case "disable":
+		cmdToggle(o, false)
+	case "prune":
+		cmdPrune(o)
+	case "tick":
+		cmdTick()
+	case "exec":
+		cmdExec(o)
+	case "names":
+		cmdNames(o)
+	case "path":
+		fmt.Println(dbPath())
+	}
+}

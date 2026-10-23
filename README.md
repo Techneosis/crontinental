@@ -17,8 +17,8 @@ crontinental every 10m --name deploy-wait --until-done --until "4 hours" \
                                          -- 'curl -sf https://example.com/healthz && exit 99'
 ```
 
-**Reservations:** Linux with a systemd user manager, and Python 3.10 or newer.
-Nothing to pip-install.
+**Reservations:** Linux with a systemd user manager. Crontinental is one static
+binary with no runtime; building it from a checkout needs Go.
 
 ```
 git clone https://github.com/Techneosis/crontinental && cd crontinental
@@ -198,7 +198,7 @@ Ledger, and the Concierge is a permanent member of staff.
 
 | | |
 |---|---|
-| `bin/crontinental` | the whole establishment: one Python file, standard library only |
+| `cmd/crontinental/` | the whole establishment: one static Go binary |
 | `systemd/crontinental.{timer,service}` | the Concierge's rounds |
 | `completions/crontinental.bash` | the bell on the desk (tab completion) |
 | `agents/` | the Clientele's Handbook (a Claude Code skill) and the `CLAUDE.md` notice |

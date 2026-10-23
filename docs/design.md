@@ -172,12 +172,12 @@ from finishing: a disabled job is kept until someone removes it.
 
 ## Files
 
-- `bin/crontinental`: the whole thing, one stdlib-only Python file
+- `cmd/crontinental/`: the whole thing, in Go; one static binary
 - `systemd/crontinental.{timer,service}`: the tick
 - `completions/crontinental.bash`: tab completion for verbs and job names
 - `install.sh`: links the three into `~/.local/bin`, `~/.config/systemd/user`
   and bash-completion's user directory, then starts the timer
-- `tests/`: the suite (`python3 -m unittest discover tests`)
+- `tests/`: the suite (`python3 -m unittest discover tests`), black-box over the CLI
 - `~/.local/share/crontinental/ledger.db`: jobs and run history
   (`CRONTINENTAL_DB` overrides it, which is how the tests run without touching
   the real one)
