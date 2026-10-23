@@ -2,20 +2,20 @@
 """Run a command later, once or on a repeat, without creating a systemd unit for it.
 
 Usage:
-  techneosis-ai-schedule in 90m  --name pr-recheck -- gh pr checks 412
-  techneosis-ai-schedule at "tomorrow 09:00" --name thaw -- ~/bin/thaw-staging
-  techneosis-ai-schedule every "Mon..Fri 07:30" --name standup --forever -- techneosis-sb agenda
-  techneosis-ai-schedule every 30m --name watch --until "2 hours" -- 'curl -sf https://x/health || exit 1'
+  crontinental in 90m  --name pr-recheck -- gh pr checks 412
+  crontinental at "tomorrow 09:00" --name thaw -- ~/bin/thaw-staging
+  crontinental every "Mon..Fri 07:30" --name standup --forever -- techneosis-sb agenda
+  crontinental every 30m --name watch --until "2 hours" -- 'curl -sf https://x/health || exit 1'
 
-  techneosis-ai-schedule list [--all]      what is scheduled
-  techneosis-ai-schedule show <name>       one job, in full
-  techneosis-ai-schedule log <name>        its output, from the journal
-  techneosis-ai-schedule run <name>        fire it now, off-schedule
-  techneosis-ai-schedule rm <name>         drop it
-  techneosis-ai-schedule enable|disable <name>
-  techneosis-ai-schedule tick              what the timer calls (dispatch what is due)
-  techneosis-ai-schedule exec <name>       what a job's own unit calls (internal)
-  techneosis-ai-schedule names [--enabled|--disabled]   bare job names (tab completion)
+  crontinental list [--all]      what is scheduled
+  crontinental show <name>       one job, in full
+  crontinental log <name>        its output, from the journal
+  crontinental run <name>        fire it now, off-schedule
+  crontinental rm <name>         drop it
+  crontinental enable|disable <name>
+  crontinental tick              what the timer calls (dispatch what is due)
+  crontinental exec <name>       what a job's own unit calls (internal)
+  crontinental names [--enabled|--disabled]   bare job names (tab completion)
 
 Design, and why it is split this way:
 
@@ -24,14 +24,14 @@ Design, and why it is split this way:
   creates dies with the user manager -- so "run this tomorrow at 09:00" silently
   evaporates at the next reboot, which on Arch is never far away. A row survives.
 
-  THE HEARTBEAT is one timer (techneosis-ai-schedule.timer, 1/min) shared by
+  THE HEARTBEAT is one timer (crontinental.timer, 1/min) shared by
   every job, so adding work never means adding a unit, a daemon-reload, or an
   enable. That is the entire point: agents schedule things, and agent-written
   unit files would accumulate outside the dotfiles repo and drift from it.
 
   EXECUTION is a transient unit per run, via systemd-run. Each job therefore
   gets its own cgroup, its own journal stream (`journalctl --user -u
-  techneosis-ai-job-<name>`), and its own RuntimeMaxSec -- none of which a tick
+  crontinental-job-<name>`), and its own RuntimeMaxSec -- none of which a tick
   that ran jobs inline could give it, and any one of which a wedged job would
   otherwise take from every other job. The tick only ever spawns and returns, so
   it stays sub-second no matter what it launched.
@@ -60,12 +60,12 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "techneosis-schedule"
-DB_PATH = Path(os.environ.get("SCHEDULE_DB", DATA_DIR / "schedule.db"))
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "crontinental"
+DB_PATH = Path(os.environ.get("CRONTINENTAL_DB", DATA_DIR / "ledger.db"))
 SELF = str(Path(__file__).resolve())
 
 SCHEMA_VERSION = 2
-UNIT_PREFIX = "techneosis-ai-job-"
+UNIT_PREFIX = "crontinental-job-"
 GLYPH = "󰃰"
 
 # A run that fires within this many seconds of its due time is "on time". The
@@ -181,7 +181,7 @@ def get_job(conn, name: str) -> sqlite3.Row:
 
 
 def die(msg: str, code: int = 1):
-    print(f"techneosis-ai-schedule: {msg}", file=sys.stderr)
+    print(f"crontinental: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -477,9 +477,9 @@ def record(conn, row, due_at, late, outcome, detail=None, unit=None):
 def dispatch(conn, row, due_at, late):
     unit = unit_name(row["name"])
     # systemd-run starts the unit from the user manager's environment, not this
-    # process's, so a SCHEDULE_DB override has to be handed over explicitly --
+    # process's, so a CRONTINENTAL_DB override has to be handed over explicitly --
     # otherwise a test tick dispatches jobs that record into the real database.
-    setenv = [f"--setenv=SCHEDULE_DB={os.environ['SCHEDULE_DB']}"] if "SCHEDULE_DB" in os.environ else []
+    setenv = [f"--setenv=CRONTINENTAL_DB={os.environ['CRONTINENTAL_DB']}"] if "CRONTINENTAL_DB" in os.environ else []
     p = subprocess.run(
         ["systemd-run", "--user", "--no-block", "--collect", f"--unit={unit}",
          f"--description=scheduled job: {row['name']}",
@@ -567,7 +567,7 @@ def cmd_exec(args):
     if status != 0 and row["notify"] in ("fail", "always"):
         notify("Scheduled job failed",
                f"{row['name']} exited {status} after {elapsed}s — "
-               f"techneosis-ai-schedule log {row['name']}", critical=True)
+               f"crontinental log {row['name']}", critical=True)
     elif status == 0 and row["notify"] == "always":
         notify("Scheduled job done", f"{row['name']} finished in {elapsed}s")
 
@@ -666,7 +666,7 @@ def cmd_run(args):
     # Off-schedule, so next_run is deliberately untouched: testing a job must
     # not move the schedule it is being tested against.
     dispatch(conn, r, now(), 0)
-    print(f"{r['name']}: started — techneosis-ai-schedule log {r['name']}")
+    print(f"{r['name']}: started — crontinental log {r['name']}")
 
 
 def cmd_rm(args):
@@ -712,7 +712,7 @@ def cmd_prune(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        prog="techneosis-ai-schedule",
+        prog="crontinental",
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="A repeat must end: --until <time>, --until-done (the command exits\n"

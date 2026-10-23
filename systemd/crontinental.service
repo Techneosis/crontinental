@@ -3,10 +3,10 @@ Description=Dispatch scheduled commands that have come due
 
 [Service]
 Type=oneshot
-ExecStart=%h/dev/dotfiles/scripts/techneosis-ai-schedule tick
+ExecStart=%h/.local/bin/crontinental tick
 
 # The tick never RUNS a job -- it launches each one as its own transient unit
-# (`systemd-run --user`, unit techneosis-ai-job-<name>.service) and returns. So
+# (`systemd-run --user`, unit crontinental-job-<name>.service) and returns. So
 # this timeout bounds bookkeeping only, and no job, however long or wedged, can
 # hold the tick or delay another job. Each job carries its own RuntimeMaxSec.
 TimeoutStartSec=45s

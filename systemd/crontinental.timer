@@ -3,7 +3,7 @@ Description=Scheduled command tick (one-off and recurring jobs)
 
 [Timer]
 # One minute is the resolution of the whole scheduler: a job can be no more
-# precise than this tick, and `techneosis-ai-schedule` refuses intervals shorter
+# precise than this tick, and `crontinental` refuses intervals shorter
 # than it for that reason. The tick itself only reads a table and spawns what is
 # due, so it costs a few milliseconds even when it finds work.
 OnBootSec=30s

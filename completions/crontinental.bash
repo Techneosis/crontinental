@@ -1,8 +1,8 @@
-# bash completion for techneosis-ai-schedule: verbs, job names, and flags.
+# bash completion for crontinental: verbs, job names, and flags.
 # Names come from the script's hidden `names` verb, so this never reads the
 # database itself and can't drift from its schema.
 
-_techneosis_ai_schedule() {
+_crontinental() {
     local cur prev verb i
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
@@ -38,14 +38,14 @@ _techneosis_ai_schedule() {
             if [[ $cur == -* ]]; then
                 COMPREPLY=($(compgen -W $'--lines\n--follow' -- "$cur"))
             elif ((COMP_CWORD == 2)); then
-                COMPREPLY=($(compgen -W "$(techneosis-ai-schedule names 2>/dev/null)" -- "$cur"))
+                COMPREPLY=($(compgen -W "$(crontinental names 2>/dev/null)" -- "$cur"))
             fi ;;
         show|run|rm)
-            ((COMP_CWORD == 2)) && COMPREPLY=($(compgen -W "$(techneosis-ai-schedule names 2>/dev/null)" -- "$cur")) ;;
+            ((COMP_CWORD == 2)) && COMPREPLY=($(compgen -W "$(crontinental names 2>/dev/null)" -- "$cur")) ;;
         enable)
-            ((COMP_CWORD == 2)) && COMPREPLY=($(compgen -W "$(techneosis-ai-schedule names --disabled 2>/dev/null)" -- "$cur")) ;;
+            ((COMP_CWORD == 2)) && COMPREPLY=($(compgen -W "$(crontinental names --disabled 2>/dev/null)" -- "$cur")) ;;
         disable)
-            ((COMP_CWORD == 2)) && COMPREPLY=($(compgen -W "$(techneosis-ai-schedule names --enabled 2>/dev/null)" -- "$cur")) ;;
+            ((COMP_CWORD == 2)) && COMPREPLY=($(compgen -W "$(crontinental names --enabled 2>/dev/null)" -- "$cur")) ;;
     esac
 }
-complete -F _techneosis_ai_schedule techneosis-ai-schedule
+complete -F _crontinental crontinental

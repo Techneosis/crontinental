@@ -1,15 +1,15 @@
-# techneosis-ai-schedule
+# crontinental
 
 Run a command later — once, or on a repeat — without creating a systemd unit
 for it. Built so an agent can schedule work mid-session and have it survive the
 session, the logout, and the reboot.
 
 ```
-techneosis-ai-schedule in 90m  --name pr-recheck -- gh pr checks 412
-techneosis-ai-schedule at "tomorrow 07:00" --name thaw -- ~/bin/thaw-staging
-techneosis-ai-schedule every "Mon..Fri 07:30" --name standup --forever -- techneosis-sb agenda
-techneosis-ai-schedule every 30m --name health --until "2 hours" -- 'curl -sf https://x/health || exit 1'
-techneosis-ai-schedule every 10m --name deploy-wait --until-done --until "tomorrow" -- 'deploy-is-live && exit 99'
+crontinental in 90m  --name pr-recheck -- gh pr checks 412
+crontinental at "tomorrow 07:00" --name thaw -- ~/bin/thaw-staging
+crontinental every "Mon..Fri 07:30" --name standup --forever -- techneosis-sb agenda
+crontinental every 30m --name health --until "2 hours" -- 'curl -sf https://x/health || exit 1'
+crontinental every 10m --name deploy-wait --until-done --until "tomorrow" -- 'deploy-is-live && exit 99'
 ```
 
 ## Why not just `systemd-run --on-calendar`?
@@ -23,12 +23,12 @@ So the three concerns are split deliberately:
 
 | concern | owner |
 |---|---|
-| durability | the job table (`~/.local/share/techneosis-schedule/schedule.db`) |
-| heartbeat | one shared timer, `techneosis-ai-schedule.timer`, 1/min |
+| durability | the job table (`~/.local/share/crontinental/ledger.db`) |
+| heartbeat | one shared timer, `crontinental.timer`, 1/min |
 | execution | a transient unit per run, via `systemd-run` |
 
 The tick never *runs* a job. It reads the table, finds what is due, and launches
-each one as `techneosis-ai-job-<name>.service`, then returns — measured at
+each one as `crontinental-job-<name>.service`, then returns — measured at
 ~44ms. That is what buys per-job cgroups, per-job journal streams, and per-job
 timeouts without a single per-job file, and what guarantees one wedged job can
 neither delay the tick nor starve another job.
@@ -94,7 +94,7 @@ never look finished.
 
 This exists because agents schedule things and then their session ends. Before
 it, the way to make a repeat stop was a second one-off whose command was
-`techneosis-ai-schedule rm <first>`; now the end is part of the job.
+`crontinental rm <first>`; now the end is part of the job.
 
 Jobs that existed before ends were required were marked `--forever` by the
 schema migration, so nothing that was running stopped.
@@ -133,11 +133,11 @@ successes; `--notify never` stays quiet.
 ## Reading what happened
 
 ```
-techneosis-ai-schedule list          what is scheduled, next run, last outcome
-techneosis-ai-schedule list --all    including finished and disabled jobs
-techneosis-ai-schedule show <name>   one job in full, with its last 10 runs
-techneosis-ai-schedule log <name>    its output, from the journal (-f to follow)
-techneosis-ai-schedule run <name>    fire it now WITHOUT moving its schedule
+crontinental list          what is scheduled, next run, last outcome
+crontinental list --all    including finished and disabled jobs
+crontinental show <name>   one job in full, with its last 10 runs
+crontinental log <name>    its output, from the journal (-f to follow)
+crontinental run <name>    fire it now WITHOUT moving its schedule
 ```
 
 A job's output is never captured into the database — it streams to the journal
@@ -165,8 +165,8 @@ from finishing: a disabled job is kept until someone removes it.
 
 ## Files
 
-- `scripts/techneosis-ai-schedule` — the whole thing
-- `systemd/.config/systemd/user/techneosis-ai-schedule.{timer,service}` — the tick
-- `~/.local/share/techneosis-schedule/schedule.db` — jobs and run history
-  (`SCHEDULE_DB` overrides it, which is how the tool is tested without touching
+- `scripts/crontinental` — the whole thing
+- `systemd/.config/systemd/user/crontinental.{timer,service}` — the tick
+- `~/.local/share/crontinental/ledger.db` — jobs and run history
+  (`CRONTINENTAL_DB` overrides it, which is how the tool is tested without touching
   the real one)
