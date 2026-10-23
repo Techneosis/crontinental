@@ -4,8 +4,8 @@
 Usage:
   techneosis-ai-schedule in 90m  --name pr-recheck -- gh pr checks 412
   techneosis-ai-schedule at "tomorrow 09:00" --name thaw -- ~/bin/thaw-staging
-  techneosis-ai-schedule every "Mon..Fri 07:30" --name standup -- techneosis-sb agenda
-  techneosis-ai-schedule every 30m --name watch -- 'curl -sf https://x/health || exit 1'
+  techneosis-ai-schedule every "Mon..Fri 07:30" --name standup --forever -- techneosis-sb agenda
+  techneosis-ai-schedule every 30m --name watch --until "2 hours" -- 'curl -sf https://x/health || exit 1'
 
   techneosis-ai-schedule list [--all]      what is scheduled
   techneosis-ai-schedule show <name>       one job, in full
@@ -36,6 +36,13 @@ Design, and why it is split this way:
   otherwise take from every other job. The tick only ever spawns and returns, so
   it stays sub-second no matter what it launched.
 
+  EVERY JOB ENDS, and then it goes away. A one-off ends when it fires. A repeat
+  has to say how it ends when it is created -- `--until <time>`, `--until-done`
+  (the command exits 99 when its work is finished), or `--forever` -- and is
+  refused otherwise, so a job that runs forever is a choice someone made rather
+  than an agent forgetting to clean up. A finished job leaves `list` at once and
+  the tick deletes it RETAIN_SEC later; until then `show` and `log` still work.
+
   Calendar and timespan parsing is systemd's (`systemd-analyze calendar` /
   `timespan`), never hand-rolled: same grammar as every unit on this box, and
   no cron-parser dependency to keep alive.
@@ -57,7 +64,7 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) /
 DB_PATH = Path(os.environ.get("SCHEDULE_DB", DATA_DIR / "schedule.db"))
 SELF = str(Path(__file__).resolve())
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 UNIT_PREFIX = "techneosis-ai-job-"
 GLYPH = "󰃰"
 
@@ -68,6 +75,13 @@ GLYPH = "󰃰"
 GRACE_SEC = 120
 
 DEFAULT_TIMEOUT_SEC = 3600
+
+# The exit status a command uses to say "my work is finished, stop running me".
+# Not 100: apt-get exits 100 on error, and a failing job must never look done.
+DONE_EXIT = 99
+
+# How long a finished job stays around for show/log before the tick deletes it.
+RETAIN_SEC = 3 * 86400
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS job (
@@ -81,6 +95,9 @@ CREATE TABLE IF NOT EXISTS job (
   next_run     TEXT,                       -- ISO-8601 UTC; NULL once a one-off has fired
   catchup      TEXT NOT NULL DEFAULT 'run',-- 'run' | 'skip' a fire that is more than GRACE_SEC late
   until        TEXT,                       -- repeats stop here
+  until_done   INTEGER NOT NULL DEFAULT 0, -- repeat ends when the command exits DONE_EXIT
+  forever      INTEGER NOT NULL DEFAULT 0, -- repeat with no end, chosen explicitly
+  finished_at  TEXT,                       -- set when the job can never run again; reaped RETAIN_SEC later
   timeout_sec  INTEGER NOT NULL,
   notify       TEXT NOT NULL DEFAULT 'fail', -- 'never' | 'fail' | 'always'
   enabled      INTEGER NOT NULL DEFAULT 1,
@@ -100,7 +117,7 @@ CREATE TABLE IF NOT EXISTS run (
   started_at  TEXT,
   finished_at TEXT,
   status      INTEGER,                     -- process exit code; NULL while running
-  outcome     TEXT NOT NULL,               -- 'running'|'ok'|'fail'|'killed'|'skipped'|'overlap'|'error'
+  outcome     TEXT NOT NULL,               -- 'running'|'ok'|'done'|'fail'|'killed'|'skipped'|'overlap'|'error'
   late_sec    INTEGER,
   detail      TEXT
 );
@@ -131,10 +148,29 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
-    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < 2:
+        migrate_v2(conn)
+    if version < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
     return conn
+
+
+def migrate_v2(conn):
+    """Add the lifecycle columns. Every repeat that already exists without an
+    end was scheduled before an end was required, so it is marked --forever
+    rather than left to be refused or expired; anything already finished starts
+    its retention clock now instead of being deleted on the first tick."""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(job)")}
+    for col, decl in (("until_done", "INTEGER NOT NULL DEFAULT 0"),
+                      ("forever", "INTEGER NOT NULL DEFAULT 0"),
+                      ("finished_at", "TEXT")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE job ADD COLUMN {col} {decl}")
+    conn.execute("UPDATE job SET forever=1 WHERE kind='repeat' AND until IS NULL")
+    conn.execute("UPDATE job SET finished_at=? WHERE finished_at IS NULL AND enabled=0"
+                 " AND next_run IS NULL AND (kind='once' OR until<=?)", (iso(now()), iso(now())))
 
 
 def get_job(conn, name: str) -> sqlite3.Row:
@@ -256,6 +292,26 @@ def humanize(dt: datetime | None) -> str:
     return f"{local:%a %m-%d %H:%M} ({rel})"
 
 
+def describe_end(row) -> str:
+    if row["kind"] == "once":
+        return "when it fires"
+    if row["forever"]:
+        return "never (--forever)"
+    parts = []
+    if row["until"]:
+        parts.append(f"at {humanize(parse_iso(row['until']))}")
+    if row["until_done"]:
+        parts.append(f"when the command exits {DONE_EXIT}")
+    return ", or ".join(parts) or "never (scheduled before ends were required)"
+
+
+def finish_job(conn, job_id: int):
+    """The job can never run again: off the schedule, and onto the reaper's clock."""
+    conn.execute("UPDATE job SET enabled=0, next_run=NULL, finished_at=? WHERE id=?",
+                 (iso(now()), job_id))
+    conn.commit()
+
+
 # --------------------------------------------------------------------------- add
 
 def cmd_add(args, kind: str):
@@ -311,16 +367,29 @@ def cmd_add(args, kind: str):
         default_catchup = "skip"
 
     until = parse_when(args.until) if args.until else None
+    if until and until <= now():
+        die(f"--until is in the past: {until.astimezone():%Y-%m-%d %H:%M}")
+    if kind == "repeat":
+        if args.forever and (until or args.until_done):
+            die("--forever contradicts --until/--until-done; pick one")
+        if not (until or args.until_done or args.forever):
+            die("a repeat has to say how it ends:\n"
+                "  --until <time>   stop after a deadline (\"tomorrow 18:00\", \"3 days\")\n"
+                f"  --until-done     stop when the command exits {DONE_EXIT} (polling for something)\n"
+                "  --forever        never stop -- only for jobs meant to be permanent")
+    elif args.forever or args.until_done:
+        die("--forever/--until-done are for repeats; a one-off ends when it fires")
     workdir = str(Path(args.workdir).expanduser().resolve()) if args.workdir else None
     if workdir and not Path(workdir).is_dir():
         die(f"--workdir is not a directory: {workdir}")
 
     conn.execute(
         "INSERT INTO job (name, command, workdir, kind, spec, interval_sec, next_run,"
-        " catchup, until, timeout_sec, notify, note, created_at, created_by)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " catchup, until, until_done, forever, timeout_sec, notify, note, created_at, created_by)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (name, command, workdir, kind, spec, interval, iso(when),
          args.catchup or default_catchup, iso(until),
+         1 if args.until_done else 0, 1 if args.forever else 0,
          systemd_timespan(args.timeout) if args.timeout else DEFAULT_TIMEOUT_SEC,
          args.notify, args.note, iso(now()), args.by or provenance()))
     conn.commit()
@@ -328,6 +397,7 @@ def cmd_add(args, kind: str):
     print(f"{name}: next run {humanize(when)}")
     if kind == "repeat":
         print(f"  repeating: {'every ' + spec if interval else spec}")
+        print(f"  ends: {describe_end(conn.execute('SELECT * FROM job WHERE name=?', (name,)).fetchone())}")
     print(f"  command: {command}")
 
 
@@ -344,6 +414,7 @@ def join_command(parts: list[str]) -> str:
 def cmd_tick(args):
     conn = connect()
     t = now()
+    reap(conn, t)
     due = conn.execute(
         "SELECT * FROM job WHERE enabled=1 AND next_run IS NOT NULL AND next_run<=?"
         " ORDER BY next_run", (iso(t),)).fetchall()
@@ -353,8 +424,7 @@ def cmd_tick(args):
         late = int((t - due_at).total_seconds())
 
         if row["until"] and t >= parse_iso(row["until"]):
-            conn.execute("UPDATE job SET enabled=0, next_run=NULL WHERE id=?", (row["id"],))
-            conn.commit()
+            finish_job(conn, row["id"])
             continue
 
         # Advance BEFORE dispatching. If anything below throws, the job has
@@ -371,14 +441,28 @@ def cmd_tick(args):
 
 
 def advance(conn, row, t: datetime):
-    if row["kind"] == "once":
-        conn.execute("UPDATE job SET next_run=NULL, enabled=0 WHERE id=?", (row["id"],))
-    else:
+    nxt = None
+    if row["kind"] == "repeat":
         nxt = next_fire(row, t)
         if nxt and row["until"] and nxt >= parse_iso(row["until"]):
             nxt = None
-        conn.execute("UPDATE job SET next_run=?, enabled=? WHERE id=?",
-                     (iso(nxt), 1 if nxt else 0, row["id"]))
+    if nxt is None:
+        finish_job(conn, row["id"])
+    else:
+        conn.execute("UPDATE job SET next_run=? WHERE id=?", (iso(nxt), row["id"]))
+        conn.commit()
+
+
+def reap(conn, t: datetime):
+    """Delete jobs finished more than RETAIN_SEC ago (their runs cascade). A run
+    still marked running holds its job back, so a long last run is never pulled
+    out from under its own `exec` -- unless that row is older than RETAIN_SEC,
+    which only an `exec` killed too hard to write down its ending leaves behind."""
+    cutoff = iso(t - timedelta(seconds=RETAIN_SEC))
+    conn.execute(
+        "DELETE FROM job WHERE finished_at IS NOT NULL AND finished_at<? AND NOT EXISTS"
+        " (SELECT 1 FROM run WHERE run.job_id=job.id AND outcome='running' AND started_at>=?)",
+        (cutoff, cutoff))
     conn.commit()
 
 
@@ -468,6 +552,16 @@ def cmd_exec(args):
         sys.exit(1)
 
     elapsed = int((now() - started).total_seconds())
+    if status == DONE_EXIT:
+        # The job's own verdict that there is nothing left to do. Honoured on
+        # every job, declared or not: a command that says it is finished and
+        # keeps getting run is worse than one that stops a little early.
+        finish(status, "done")
+        finish_job(conn, row["id"])
+        if row["notify"] == "always":
+            notify("Scheduled job finished", f"{row['name']} reported done after {elapsed}s")
+        sys.exit(0)  # done is success; the unit should not show as failed
+
     finish(status, "ok" if status == 0 else "fail")
 
     if status != 0 and row["notify"] in ("fail", "always"):
@@ -503,9 +597,9 @@ def cmd_list(args):
     w = max(len(r["name"]) for r in rows)
     for r in rows:
         lr = last_run(conn, r["id"])
-        state = "" if r["enabled"] else ("done" if r["kind"] == "once" and lr else "off")
+        state = "" if r["enabled"] else ("done" if r["finished_at"] else "off")
         when = humanize(parse_iso(r["next_run"])) if r["next_run"] else state or "-"
-        mark = {"ok": "ok", "fail": "FAIL", "killed": "KILLED", "running": "running",
+        mark = {"ok": "ok", "done": "done", "fail": "FAIL", "killed": "KILLED", "running": "running",
                 "skipped": "skipped", "overlap": "overlap", "error": "ERROR"}.get(
                     lr["outcome"], "") if lr else ""
         kind = "every " + (r["spec"] or "") if r["kind"] == "repeat" else "once"
@@ -537,7 +631,10 @@ def cmd_show(args):
     print(f"timeout     {r['timeout_sec']}s")
     print(f"notify      {r['notify']}")
     print(f"enabled     {'yes' if r['enabled'] else 'no'}")
-    print(f"until       {humanize(parse_iso(r['until'])) if r['until'] else '-'}")
+    print(f"ends        {describe_end(r)}")
+    if r["finished_at"]:
+        gone = parse_iso(r["finished_at"]) + timedelta(seconds=RETAIN_SEC)
+        print(f"finished    {humanize(parse_iso(r['finished_at']))}; deleted {humanize(gone)}")
     print(f"created     {humanize(parse_iso(r['created_at']))} by {r['created_by']}")
     if r["note"]:
         print(f"note        {r['note']}")
@@ -593,8 +690,10 @@ def cmd_toggle(args, on: bool):
         if nxt is None or (r["until"] and nxt >= parse_iso(r["until"])):
             die(f"{r['name']} has passed its --until ({humanize(parse_iso(r['until']))}); "
                 "schedule a new one")
-    conn.execute("UPDATE job SET enabled=?, next_run=? WHERE id=?",
-                 (1 if on else 0, iso(nxt) if on else r["next_run"], r["id"]))
+    # Re-enabling a finished repeat takes it back off the reaper's clock.
+    conn.execute("UPDATE job SET enabled=?, next_run=?, finished_at=? WHERE id=?",
+                 (1 if on else 0, iso(nxt) if on else r["next_run"],
+                  None if on else r["finished_at"], r["id"]))
     conn.commit()
     print(f"{r['name']}: {'enabled, next run ' + humanize(nxt) if on else 'disabled'}")
 
@@ -603,10 +702,10 @@ def cmd_prune(args):
     conn = connect()
     cutoff = iso(now() - timedelta(days=args.days))
     n = conn.execute(
-        "DELETE FROM job WHERE kind='once' AND enabled=0 AND created_at<?", (cutoff,)).rowcount
+        "DELETE FROM job WHERE finished_at IS NOT NULL AND finished_at<?", (cutoff,)).rowcount
     conn.commit()
     conn.execute("VACUUM")
-    print(f"pruned {n} finished one-off job(s) older than {args.days}d")
+    print(f"pruned {n} finished job(s) older than {args.days}d")
 
 
 # --------------------------------------------------------------------------- cli
@@ -616,7 +715,9 @@ def main():
         prog="techneosis-ai-schedule",
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Everything after `--` is the command. One argument is taken as a\n"
+        epilog="A repeat must end: --until <time>, --until-done (the command exits\n"
+               f"{DONE_EXIT} when finished), or --forever. Finished jobs are deleted after 3 days.\n\n"
+               "Everything after `--` is the command. One argument is taken as a\n"
                "shell line (pipes and && work); several are taken as an argv.\n"
                "Every job runs under `bash -lc`, so node/mise/~/.local/bin are on\n"
                "PATH exactly as they are in a terminal.")
@@ -629,7 +730,11 @@ def main():
         p.add_argument("--catchup", choices=["run", "skip"],
                        help="a fire more than %ds late: run it anyway, or skip to the "
                             "next one (default: run for one-offs, skip for repeats)" % GRACE_SEC)
-        p.add_argument("--until", help="stop repeating after this time")
+        p.add_argument("--until", help="a repeat ends at this time (anything `date -d` reads)")
+        p.add_argument("--until-done", action="store_true",
+                       help=f"a repeat ends when the command exits {DONE_EXIT}")
+        p.add_argument("--forever", action="store_true",
+                       help="a repeat that never ends; required when no end is given")
         p.add_argument("--notify", choices=["never", "fail", "always"], default="fail")
         p.add_argument("--note", help="why this exists")
         p.add_argument("--by", help="who scheduled it (default: the Claude session, or $USER)")
@@ -680,8 +785,8 @@ def main():
     p.add_argument("name")
     p.set_defaults(func=lambda a: cmd_toggle(a, False))
 
-    p = sub.add_parser("prune", help="drop finished one-offs")
-    p.add_argument("--days", type=int, default=7)
+    p = sub.add_parser("prune", help="drop finished jobs now (the tick does it after 3 days)")
+    p.add_argument("--days", type=int, default=0)
     p.set_defaults(func=cmd_prune)
 
     p = sub.add_parser("tick", help="dispatch everything due (the timer calls this)")

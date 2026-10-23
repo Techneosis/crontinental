@@ -7,8 +7,9 @@ session, the logout, and the reboot.
 ```
 techneosis-ai-schedule in 90m  --name pr-recheck -- gh pr checks 412
 techneosis-ai-schedule at "tomorrow 07:00" --name thaw -- ~/bin/thaw-staging
-techneosis-ai-schedule every "Mon..Fri 07:30" --name standup -- techneosis-sb agenda
-techneosis-ai-schedule every 30m --name health -- 'curl -sf https://x/health || exit 1'
+techneosis-ai-schedule every "Mon..Fri 07:30" --name standup --forever -- techneosis-sb agenda
+techneosis-ai-schedule every 30m --name health --until "2 hours" -- 'curl -sf https://x/health || exit 1'
+techneosis-ai-schedule every 10m --name deploy-wait --until-done --until "tomorrow" -- 'deploy-is-live && exit 99'
 ```
 
 ## Why not just `systemd-run --on-calendar`?
@@ -71,6 +72,33 @@ time. Write `03:00`.
 after each run rather than landing on wall-clock boundaries. Anything under one
 minute is refused: the tick is the resolution.
 
+## Every job ends
+
+A one-off ends when it fires. **A repeat has to say how it ends** when it is
+created, or it is refused:
+
+| flag | ends |
+|---|---|
+| `--until <time>` | at a deadline — anything `date -d` reads (`"tomorrow 18:00"`, `"3 days"`) |
+| `--until-done` | when the command exits **99**: the job itself decides its work is finished |
+| `--forever` | never — the only way to get a permanent job, so it is always a choice |
+
+`--until` and `--until-done` combine (stop at whichever comes first), which is
+the right shape for polling: "until it's live, but give up tomorrow".
+`--forever` contradicts both.
+
+Exit 99 is honoured on every job, declared or not, and counts as success: the
+run is recorded as `done`, nothing notifies (except `--notify always`), and the
+unit exits 0. Not 100 — apt-get exits 100 on error, and a failing job must
+never look finished.
+
+This exists because agents schedule things and then their session ends. Before
+it, the way to make a repeat stop was a second one-off whose command was
+`techneosis-ai-schedule rm <first>`; now the end is part of the job.
+
+Jobs that existed before ends were required were marked `--forever` by the
+schema migration, so nothing that was running stopped.
+
 ## What happens when the box was asleep
 
 Due times live in the table, so a tick missed while suspended is not a lost job
@@ -106,7 +134,7 @@ successes; `--notify never` stays quiet.
 
 ```
 techneosis-ai-schedule list          what is scheduled, next run, last outcome
-techneosis-ai-schedule list --all    including finished one-offs and disabled jobs
+techneosis-ai-schedule list --all    including finished and disabled jobs
 techneosis-ai-schedule show <name>   one job in full, with its last 10 runs
 techneosis-ai-schedule log <name>    its output, from the journal (-f to follow)
 techneosis-ai-schedule run <name>    fire it now WITHOUT moving its schedule
@@ -124,8 +152,15 @@ to, and `list` is the audit of it.
 
 ## Housekeeping
 
-One-offs disable themselves after firing and stay visible under `list --all` as
-a record. `techneosis-ai-schedule prune` drops the ones older than 7 days.
+A job tears itself down. When it can never run again — a one-off fired, a
+deadline passed, or the command exited 99 — it leaves `list` at once (`list
+--all` shows it as `done`, `show` says when it will go) and the tick deletes it,
+with its run history, **3 days later**. Its output stays in the journal after
+that. A run still in progress holds its job back.
+
+`enable` on a finished repeat takes it off that clock. `disable` is different
+from finishing: a disabled job is kept until someone removes it.
+`prune [--days N]` deletes finished jobs now instead of waiting.
 `rm <name>` stops a running instance and deletes the job.
 
 ## Files
