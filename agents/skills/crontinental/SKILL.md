@@ -41,7 +41,7 @@ crontinental rm <name>       remove it
 ```
 
 **Always pass `--name`.** It is how the job is found later, and it becomes the
-name of the unit each run gets (lowercase letters, digits, `-`, `_`).
+name of its runs and its log (lowercase letters, digits, `-`, `_`).
 
 ## How a job ends
 
@@ -76,8 +76,9 @@ can't be edited into having no end.
 Everything after `--`. **One** argument is a shell line, verbatim: pipes, `&&`,
 redirects and `$(…)` all work. **Several** are an argv, quoted safely.
 
-Jobs run in a login shell (`bash -lc`), so PATH is the one the user's terminal
-has, not the service manager's bare one. Absolute paths are not needed, though
+Jobs run in a login shell (`bash -lc` on Linux, the user's own login shell on
+macOS), so PATH is the one the user's terminal has, not the service manager's
+bare one. Absolute paths are not needed, though
 they don't hurt.
 
 ## Schedules

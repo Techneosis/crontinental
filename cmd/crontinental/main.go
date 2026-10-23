@@ -110,8 +110,8 @@ A repeat must end: --until <time>, --until-done (the command exits
 
 Everything after ` + "`--`" + ` is the command. One argument is taken as a
 shell line (pipes and && work); several are taken as an argv.
-Every job runs under ` + "`bash -lc`" + `, so node/mise/~/.local/bin are on
-PATH exactly as they are in a terminal.
+Every job runs in a login shell (bash -lc on Linux, your own login shell on
+macOS), so PATH is the one your terminal has.
 `
 
 // usageErr is argparse's behaviour for a malformed command line: exit 2.

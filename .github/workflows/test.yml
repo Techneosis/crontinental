@@ -2,7 +2,10 @@ name: test
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -12,8 +15,11 @@ jobs:
         with:
           python-version: "3.13"
       - run: go vet ./...
-      # The grammars against systemd-analyze and GNU date, both present here.
+      # Linux: the grammars against systemd-analyze and GNU date. macOS: the
+      # fixed-answer tests (the tools aren't there to compare against).
       - run: go test ./...
       - run: CGO_ENABLED=0 go build -trimpath -o build/crontinental ./cmd/crontinental
-      # The suite is black-box: it runs the built binary through its CLI.
+      # The suite is black-box: it runs the built binary through its CLI. On
+      # macOS that includes real runs (test_runs.py); Linux runners have no
+      # systemd user manager, so those skip there.
       - run: CRONTINENTAL_BIN=$PWD/build/crontinental python -m unittest discover -v tests

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The tick on macOS: launchd runs `crontinental tick` every 60 seconds, the
+  one job it ever runs. Each scheduled job is started by the tick in a session
+  of its own, so launchd never manages (or kills) a job directly.
+
+  install.sh fills in @BIN@ and @LOGDIR@: launchd takes no ~ or $HOME.
+  Missed ticks while asleep are not replayed; the first tick after waking finds
+  everything that came due, and each job's --catchup decides.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.techneosis.crontinental</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BIN@</string>
+    <string>tick</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Jobs run in sessions of their own already; this is the backstop that
+       stops launchd reaping anything the tick started when the tick exits. -->
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@LOGDIR@/tick.log</string>
+  <key>StandardErrorPath</key>
+  <string>@LOGDIR@/tick.log</string>
+</dict>
+</plist>

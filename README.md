@@ -17,12 +17,13 @@ crontinental every 10m --name deploy-wait --until-done --until "4 hours" \
                                          -- 'curl -sf https://example.com/healthz && exit 99'
 ```
 
-**Reservations:** Linux with a systemd user manager. Crontinental is one static
-binary with no runtime; building it from a checkout needs Go.
+**Reservations:** Linux with a systemd user manager, or macOS. Crontinental is
+one static binary with no runtime; building it from a checkout needs Go
+(`./install.sh --no-build` installs a binary you already have).
 
 ```
 git clone https://github.com/Techneosis/crontinental && cd crontinental
-./install.sh               # links the binary, the units and tab completion; starts the tick
+./install.sh               # links the binary and tab completion; starts the tick
 ./install.sh --uninstall   # the reverse (the ledger is kept)
 ```
 
@@ -48,11 +49,11 @@ departure when it is booked, or the front desk turns it away:
 A guest may hold both of the first two: *"stay until the deploy is live, but
 not past tonight."*
 
-**2. One guest per room.** Each stay gets a room of its own (a transient
-systemd unit), with its own walls (a cgroup), its own logbook (a journal
-stream) and its own time limit. A guest who is still in residence cannot check
-in a second time under the same name. The desk notes the attempt as an
-`overlap` and sends them away.
+**2. One guest per room.** Each stay gets a room of its own, with its own
+walls, its own logbook and its own time limit, and a guest who is still in
+residence cannot check in a second time under the same name. The desk notes
+the attempt as an `overlap` and sends them away. How the rooms are built
+depends on the building: see [Two Buildings](#two-buildings).
 
 **3. No guest overstays.** Every stay has a limit, one hour unless arranged
 otherwise (`--timeout 20m`). At the limit the room is cleared, the whole party
@@ -75,7 +76,7 @@ occupied room.
 reservation and every stay is written here, and nothing else is trusted. The
 building can lose power and the bookings are still on the page in the morning.
 
-**The Concierge** (`crontinental.timer`, every minute). Makes one
+**The Concierge** (the tick, every minute). Makes one
 round a minute, the only one on staff with a key to the Ledger's schedule. On
 each round they:
 
@@ -96,8 +97,27 @@ with a 99, it is the Steward who closes the reservation.
 
 **The Cleaners.** Three days after a guest checks out, their entry and its
 history are cleared from the Ledger. Until then, `show` and `log` still answer
-questions about the stay. The logbook (the journal) is kept on its own terms,
-after the room itself is long gone.
+questions about the stay. The logbook is kept on its own terms, after the room
+itself is long gone.
+
+---
+
+## Two Buildings
+
+The house rules are the same in both; the plumbing is local.
+
+| | Linux | macOS |
+|---|---|---|
+| the Concierge's rounds | a systemd user timer, `crontinental.timer` | a LaunchAgent, `com.techneosis.crontinental` |
+| a room | a transient systemd unit: its own cgroup | a session of its own, the command in its own process group |
+| one guest per room | systemd refuses a second unit of the same name | the Steward holds a lock the kernel lets go of when they leave |
+| the time limit | systemd's `RuntimeMaxSec` | the Steward, who clears the whole party out |
+| the logbook | the journal | `~/Library/Logs/crontinental/<name>.log`, in Console.app |
+| room service | `bash -lc` | the guest's own login shell |
+| word to the Management | the desktop's notifications | Notification Center |
+
+On macOS a guest who must leave early (`rm`) is asked by the Steward, and
+shown out with their whole party if they don't go.
 
 ---
 
@@ -132,9 +152,10 @@ The house does not accept `daily 03:00`: `daily` already means midnight and
 takes no time. Write `03:00`. Nothing is booked more often than once a minute,
 because that is how often the Concierge comes by.
 
-**Room service.** Every guest is served by a login shell (`bash -lc`) and
-starts in `$HOME` unless `--workdir` says otherwise, so the PATH is the one
-your terminal has, not systemd's bare one. One note on the kitchen: if your
+**Room service.** Every guest is served by a login shell (`bash -lc` on
+Linux, the user's own on macOS) and starts in `$HOME` unless `--workdir` says
+otherwise, so the PATH is the one your terminal has, not the service manager's
+bare one. One note on the kitchen: if your
 profile puts mise's shims ahead of nvm and mise has no global node, `node` and
 `npx` refuse to serve. Guests who need node should bring their own (put the one
 they want first on PATH).
@@ -238,7 +259,8 @@ Ledger, and the Concierge is a permanent member of staff.
 | | |
 |---|---|
 | `cmd/crontinental/` | the whole establishment: one static Go binary |
-| `systemd/crontinental.{timer,service}` | the Concierge's rounds |
+| `systemd/crontinental.{timer,service}` | the Concierge's rounds, on Linux |
+| `launchd/com.techneosis.crontinental.plist` | the Concierge's rounds, on macOS |
 | `completions/crontinental.bash` | the bell on the desk (tab completion) |
 | `agents/` | the Clientele's Handbook (a Claude Code skill) and the `CLAUDE.md` notice |
 | `tests/` | rehearsals: `python3 -m unittest discover tests` |

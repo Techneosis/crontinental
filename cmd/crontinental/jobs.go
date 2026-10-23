@@ -8,8 +8,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -260,48 +260,6 @@ func self() string {
 	return p
 }
 
-func dispatch(db *sql.DB, j *Job, dueAt time.Time, late int64) {
-	unit := unitName(j.Name)
-	args := []string{"--user", "--no-block", "--collect", "--unit=" + unit,
-		"--description=scheduled job: " + j.Name,
-		fmt.Sprintf("--property=RuntimeMaxSec=%d", j.TimeoutSec),
-		// Tag the output with the job, in the stream itself. journald otherwise
-		// attributes stdout to a unit by looking up the writing process, and a
-		// job that prints and exits at once can be gone before it looks: the line
-		// is kept but never shows under -u. The identifier cannot lose that race.
-		"--property=SyslogIdentifier=" + logIdent(j.Name)}
-	// systemd-run starts the unit from the user manager's environment, not this
-	// process's, so a CRONTINENTAL_DB override has to be handed over explicitly
-	// -- otherwise a test tick dispatches jobs that record into the real ledger.
-	if v, ok := os.LookupEnv("CRONTINENTAL_DB"); ok {
-		args = append(args, "--setenv=CRONTINENTAL_DB="+v)
-	}
-	// The unit runs `exec`, not the command itself: something has to outlive
-	// the command to write down what it did, and this is the only process
-	// inside the job's own cgroup that can.
-	args = append(args, self(), "exec", j.Name, "--due", iso(dueAt), "--late", strconv.FormatInt(late, 10))
-
-	_, errb, err := runTool("systemd-run", args...)
-	if err == nil {
-		return
-	}
-	msg := strings.TrimSpace(string(errb))
-	// The transient unit name is the job name, so systemd itself refuses a
-	// second copy of a job that is still running. That refusal IS the overlap
-	// guard -- there is no lockfile to go stale. systemd words it several ways
-	// depending on how far the old unit got; all of them mean the same thing.
-	low := strings.ToLower(msg)
-	overlap := strings.Contains(low, "already") && containsAny(low, "loaded", "exists", "running", "active")
-	outcome := "error"
-	if overlap {
-		outcome = "overlap"
-	}
-	record(db, j, dueAt, late, outcome, truncate(msg, 500), unit)
-	if !overlap && j.Notify != "never" {
-		notify("Scheduled job could not start", j.Name+": "+truncate(msg, 160), true)
-	}
-}
-
 func containsAny(s string, subs ...string) bool {
 	for _, sub := range subs {
 		if strings.Contains(s, sub) {
@@ -313,49 +271,92 @@ func containsAny(s string, subs ...string) bool {
 
 // --------------------------------------------------------------------- exec
 
-// cmdExec is what the transient unit runs. The command's own output streams
-// straight to the journal (no capture), so `log` has one source of truth.
+// cmdExec is what each run is: the process that starts the command and
+// outlives it to write down what it did. On Linux it is the run's transient
+// unit; on macOS the tick starts it in a session of its own. The command's
+// output goes straight to the run's log (no capture), so `log` has one source
+// of truth.
 func cmdExec(o *opts) {
 	db := connect()
 	j := getJob(db, o.name)
-	unit := unitName(j.Name)
+	ref := runRef(j.Name)
 	dueAt := now()
 	if o.due != "" {
 		dueAt = parseISO(o.due)
 	}
 	started := now()
 
+	// The overlap guard, where the platform has no unit to refuse a second
+	// copy (macOS): a lock only one run of a job can hold.
+	g, ok := guardRun(j.Name)
+	if !ok {
+		record(db, j, dueAt, o.late, "overlap", "a run of this job is still going", ref)
+		return
+	}
+
 	res := mustExec(db, `INSERT INTO run (job_id, unit, due_at, started_at, outcome, late_sec)
-		VALUES (?,?,?,?, 'running', ?)`, j.ID, unit, iso(dueAt), iso(started), o.late)
+		VALUES (?,?,?,?, 'running', ?)`, j.ID, ref, iso(dueAt), iso(started), o.late)
 	runID, _ := res.LastInsertId()
 
 	finish := func(status int, outcome, detail string) {
 		mustExec(db, "UPDATE run SET finished_at=?, status=?, outcome=?, detail=? WHERE id=?",
 			iso(now()), status, outcome, nullIfEmpty(detail), runID)
 	}
-
-	// RuntimeMaxSec expired, or someone stopped the unit. systemd kills the
-	// whole cgroup, so the child is already going; all that is left is to say
-	// so before this process goes too.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGTERM)
-	go func() {
-		sig := (<-sigs).(syscall.Signal)
-		finish(128+int(sig), "killed", fmt.Sprintf("stopped by signal %d", int(sig)))
+	killed := func(sig syscall.Signal, detail string) {
+		finish(128+int(sig), "killed", detail)
 		if j.Notify != "never" {
 			notify("Scheduled job killed", fmt.Sprintf("%s hit its %ds limit", j.Name, j.TimeoutSec), true)
 		}
+		banner("killed: " + detail)
 		os.Exit(128 + int(sig))
-	}()
+	}
 
 	workdir := homeDir()
 	if j.Workdir.Valid {
 		workdir = j.Workdir.String
 	}
-	cmd := exec.Command("/bin/bash", "-lc", j.Command)
+	banner(fmt.Sprintf("run started (due %s, late %ds)", dueAt.Local().Format("2006-01-02 15:04:05"), o.late))
+	cmd := exec.Command(shellArgv(j.Command)[0], shellArgv(j.Command)[1:]...)
 	cmd.Dir = workdir
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, os.Stdout, os.Stderr
-	err := cmd.Run()
+	// Its own process group, so a stop or a timeout reaches everything the
+	// command started, not just the shell.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	var stopReason atomic.Value // set when this process ends the command itself
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM)
+
+	err := cmd.Start()
+	if err == nil {
+		g.started(cmd.Process.Pid)
+		pgid := cmd.Process.Pid
+		stopGroup := func(reason string) {
+			stopReason.Store(reason)
+			_ = syscall.Kill(-pgid, syscall.SIGTERM)
+			time.AfterFunc(10*time.Second, func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+		}
+		go func() {
+			sig := (<-sigs).(syscall.Signal)
+			if !selfManaged {
+				// RuntimeMaxSec expired, or someone stopped the unit. systemd
+				// kills the whole cgroup, so the command is already going; all
+				// that is left is to say so before this process goes too.
+				killed(sig, fmt.Sprintf("stopped by signal %d", int(sig)))
+			}
+			stopGroup(fmt.Sprintf("stopped by signal %d", int(sig)))
+		}()
+		if selfManaged {
+			// No RuntimeMaxSec here: the timeout is this process's to enforce.
+			time.AfterFunc(time.Duration(j.TimeoutSec)*time.Second, func() {
+				stopGroup(fmt.Sprintf("hit its %ds limit", j.TimeoutSec))
+			})
+		}
+		err = cmd.Wait()
+	}
+	if r, ok := stopReason.Load().(string); ok {
+		killed(syscall.SIGTERM, r)
+	}
 
 	status := 0
 	var exitErr *exec.ExitError
@@ -363,15 +364,16 @@ func cmdExec(o *opts) {
 	case err == nil:
 	case errors.As(err, &exitErr):
 		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			status = -int(ws.Signal()) // as Python reports a child killed by a signal
+			status = -int(ws.Signal()) // as Python reported a command killed by a signal
 		} else {
 			status = exitErr.ExitCode()
 		}
-	default: // the command could not be started at all; the unit must still record why
+	default: // the command could not be started at all; the run must still record why
 		finish(-1, "error", truncate(err.Error(), 500))
 		if j.Notify != "never" {
 			notify("Scheduled job errored", truncate(j.Name+": "+err.Error(), 160), true)
 		}
+		banner("could not start: " + err.Error())
 		os.Exit(1)
 	}
 
@@ -385,7 +387,8 @@ func cmdExec(o *opts) {
 		if j.Notify == "always" {
 			notify("Scheduled job finished", fmt.Sprintf("%s reported done after %ds", j.Name, elapsed), false)
 		}
-		os.Exit(0) // done is success; the unit should not show as failed
+		banner(fmt.Sprintf("done (exit %d) after %ds", doneExit, elapsed))
+		os.Exit(0) // done is success; the run should not show as failed
 	}
 
 	outcome := "ok"
@@ -399,5 +402,6 @@ func cmdExec(o *opts) {
 	} else if status == 0 && j.Notify == "always" {
 		notify("Scheduled job done", fmt.Sprintf("%s finished in %ds", j.Name, elapsed), false)
 	}
-	os.Exit(status & 0xff) // the unit's own state should mirror the job's
+	banner(fmt.Sprintf("exit %d after %ds", status, elapsed))
+	os.Exit(status & 0xff) // the run's own exit should mirror the job's
 }

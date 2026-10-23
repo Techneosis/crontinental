@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -176,7 +174,7 @@ func cmdShow(o *opts) {
 	if j.Workdir.Valid {
 		fmt.Printf("workdir     %s\n", j.Workdir.String)
 	} else {
-		fmt.Printf("workdir     ~ (login shell, bash -lc)\n")
+		fmt.Printf("workdir     ~ (%s)\n", shellDesc())
 	}
 	kind := j.Kind
 	if j.Kind == "repeat" {
@@ -213,7 +211,8 @@ func cmdShow(o *opts) {
 	if j.Note.Valid && j.Note.String != "" {
 		fmt.Printf("note        %s\n", j.Note.String)
 	}
-	fmt.Printf("unit        %s\n", unitName(j.Name))
+	label, where := runnerInfo(j.Name)
+	fmt.Printf("%-11s %s\n", label, where)
 
 	rows, err := db.Query(`SELECT started_at, finished_at, status, outcome, late_sec, detail
 		FROM run WHERE job_id=? ORDER BY id DESC LIMIT 10`, j.ID)
@@ -254,19 +253,8 @@ func cmdShow(o *opts) {
 }
 
 func cmdLog(o *opts) {
-	db := connect()
-	j := getJob(db, o.name)
-	// systemd's own lines for the unit, OR the job's tagged output. The unit
-	// matches also find runs logged before output was tagged.
-	u := unitName(j.Name)
-	args := []string{"--user", "-n", strconv.Itoa(o.lines), "--no-pager",
-		"_SYSTEMD_USER_UNIT=" + u, "+", "USER_UNIT=" + u, "+", "SYSLOG_IDENTIFIER=" + logIdent(j.Name)}
-	if o.follow {
-		args = append(args, "-f")
-	}
-	cmd := exec.Command("journalctl", args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	_ = cmd.Run()
+	j := getJob(connect(), o.name)
+	showLog(j.Name, o.lines, o.follow)
 }
 
 func cmdRun(o *opts) {
@@ -281,7 +269,7 @@ func cmdRun(o *opts) {
 func cmdRm(o *opts) {
 	db := connect()
 	j := getJob(db, o.name)
-	_ = exec.Command("systemctl", "--user", "stop", unitName(j.Name)).Run()
+	stopRun(j.Name)
 	mustExec(db, "DELETE FROM job WHERE id=?", j.ID)
 	fmt.Printf("removed %s\n", j.Name)
 }

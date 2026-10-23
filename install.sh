@@ -8,6 +8,12 @@
 #   ./install.sh --claude-only  only the Claude Code part (no binary, no tick)
 #   ./install.sh --uninstall    remove all of it (the ledger stays)
 #   ./install.sh --uninstall --claude-only   remove only the Claude Code part
+#   ./install.sh --no-build     install build/crontinental as it is (a release
+#                               binary, or one cross-compiled elsewhere)
+#
+# Linux: the tick is a systemd user timer. macOS: it is a LaunchAgent
+# (~/Library/LaunchAgents/com.techneosis.crontinental.plist), and job output
+# goes to ~/Library/Logs/crontinental/.
 #
 # Claude Code: when ~/.claude (or $CLAUDE_CONFIG_DIR) exists, the crontinental
 # skill is linked into its skills/, and a short routing section is offered for
@@ -16,7 +22,7 @@
 # in place, never replaced, so a CLAUDE.md that is itself a symlink (dotfiles)
 # stays one.
 #
-# Paths are fixed: the tick's unit runs %h/.local/bin/crontinental.
+# Paths are fixed: the tick runs ~/.local/bin/crontinental.
 set -euo pipefail
 
 src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -28,24 +34,33 @@ claude=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 BEGIN='<!-- crontinental:begin (managed by crontinental/install.sh; edit agents/claude-md-snippet.md upstream, not here) -->'
 END='<!-- crontinental:end -->'
 
-uninstall=0 claude_only=0 claude_md=ask
+uninstall=0 claude_only=0 claude_md=ask build=1
+os=$(uname -s)
+label=com.techneosis.crontinental
+agent=$HOME/Library/LaunchAgents/$label.plist
+logdir=$HOME/Library/Logs/crontinental
 for arg in "$@"; do
   case $arg in
     --uninstall)   uninstall=1 ;;
     --claude-only) claude_only=1 ;;
     --claude)      claude_md=yes ;;
     --no-claude)   claude_md=never ;;
-    -h|--help)     sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-build)    build=0 ;;
+    -h|--help)     sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
 
 links=(
   "$src/build/crontinental:$bin/crontinental"
-  "$src/systemd/crontinental.service:$units/crontinental.service"
-  "$src/systemd/crontinental.timer:$units/crontinental.timer"
   "$src/completions/crontinental.bash:$comp/crontinental"
 )
+if [[ $os == Linux ]]; then
+  links+=(
+    "$src/systemd/crontinental.service:$units/crontinental.service"
+    "$src/systemd/crontinental.timer:$units/crontinental.timer"
+  )
+fi
 
 link() {  # link <from> <to>, refusing to clobber anything that isn't a link
   local from=$1 dst=$2
@@ -122,35 +137,66 @@ case $uninstall$claude_only in
   01) claude_install; exit 0 ;;
   11) claude_uninstall; exit 0 ;;
   10)
-    systemctl --user disable --now crontinental.timer 2>/dev/null || true
+    if [[ $os == Darwin ]]; then
+      launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+      [[ -f $agent ]] && rm "$agent" && echo "removed $agent"
+    else
+      systemctl --user disable --now crontinental.timer 2>/dev/null || true
+    fi
     for pair in "${links[@]}"; do
       dst=${pair#*:}
       [[ -L $dst ]] && rm "$dst" && echo "removed $dst"
     done
-    systemctl --user daemon-reload
+    [[ $os == Linux ]] && systemctl --user daemon-reload
     claude_uninstall
     echo "uninstalled; the ledger is left at ${XDG_DATA_HOME:-$HOME/.local/share}/crontinental/"
     exit 0 ;;
 esac
 
-command -v go >/dev/null \
-  || { echo "building crontinental from a checkout needs Go (https://go.dev/dl/)" >&2; exit 1; }
-command -v systemd-analyze >/dev/null && systemctl --user show-environment >/dev/null 2>&1 \
-  || { echo "crontinental needs a running systemd user manager" >&2; exit 1; }
+case $os in
+  Linux)
+    systemctl --user show-environment >/dev/null 2>&1 \
+      || { echo "crontinental needs a running systemd user manager" >&2; exit 1; } ;;
+  Darwin)
+    command -v launchctl >/dev/null || { echo "launchctl not found" >&2; exit 1; } ;;
+  *) echo "crontinental runs on Linux (systemd) and macOS (launchd), not $os" >&2; exit 1 ;;
+esac
 
-# Build to a temp name and rename into place: a tick that starts mid-build
-# then runs the old binary or the new one, never half of one.
-(cd "$src" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o build/crontinental.new ./cmd/crontinental)
-mv -f "$src/build/crontinental.new" "$src/build/crontinental"
-echo "built $src/build/crontinental"
+if ((build)); then
+  command -v go >/dev/null \
+    || { echo "building crontinental from a checkout needs Go (https://go.dev/dl/); or put a binary at build/crontinental and pass --no-build" >&2; exit 1; }
+  # Build to a temp name and rename into place: a tick that starts mid-build
+  # then runs the old binary or the new one, never half of one.
+  (cd "$src" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o build/crontinental.new ./cmd/crontinental)
+  mv -f "$src/build/crontinental.new" "$src/build/crontinental"
+  echo "built $src/build/crontinental"
+elif [[ ! -x $src/build/crontinental ]]; then
+  echo "--no-build, but there is no binary at $src/build/crontinental" >&2
+  exit 1
+fi
+"$src/build/crontinental" path >/dev/null \
+  || { echo "$src/build/crontinental doesn't run here (built for another platform?)" >&2; exit 1; }
 
 for pair in "${links[@]}"; do
   link "${pair%%:*}" "${pair#*:}"
 done
 
-systemctl --user daemon-reload
-systemctl --user enable --now crontinental.timer
-echo "the Concierge is on duty: $(systemctl --user is-active crontinental.timer)"
+if [[ $os == Darwin ]]; then
+  # The plist is written, not linked: launchd needs absolute paths in it.
+  mkdir -p "$(dirname "$agent")" "$logdir"
+  sed -e "s|@BIN@|$bin/crontinental|g" -e "s|@LOGDIR@|$logdir|g" \
+    "$src/launchd/$label.plist" >"$agent"
+  echo "wrote $agent"
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$agent"
+  launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 \
+    || { echo "launchd didn't take $agent" >&2; exit 1; }
+  echo "the Concierge is on duty: loaded, every 60s (logs in $logdir)"
+else
+  systemctl --user daemon-reload
+  systemctl --user enable --now crontinental.timer
+  echo "the Concierge is on duty: $(systemctl --user is-active crontinental.timer)"
+fi
 [[ :$PATH: == *":$bin:"* ]] || echo "note: $bin is not on your PATH"
 
 claude_install

@@ -1,11 +1,9 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -13,8 +11,6 @@ import (
 )
 
 const (
-	unitPrefix        = "crontinental-job-"
-	glyph             = "󰃰"
 	defaultTimeoutSec = 3600
 
 	// A run that fires within this many seconds of its due time is "on time".
@@ -125,17 +121,12 @@ func describeEnd(j *Job) string {
 	return strings.Join(parts, ", or ")
 }
 
-func unitName(name string) string { return unitPrefix + name + ".service" }
-
-// logIdent tags a job's output in the journal (see dispatch).
-func logIdent(name string) string { return unitPrefix + name }
-
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,48}$`)
 
 func validName(name string) string {
 	if !nameRe.MatchString(name) {
 		die("bad job name %q: lowercase letters, digits, - and _ only "+
-			"(it becomes a systemd unit name)", name)
+			"(it names the job's runs and its log)", name)
 	}
 	return name
 }
@@ -165,35 +156,6 @@ func provenance() string {
 		return u
 	}
 	return "unknown"
-}
-
-func notify(headline, body string, critical bool) {
-	urgency := "low"
-	if critical {
-		urgency = "critical"
-	}
-	// Omarchy's own sender where it exists: it carries the glyph and, unlike a
-	// bare notify-send there, survives the desktop's notification changes.
-	// Everywhere else the freedesktop standard.
-	var argv []string
-	if p, err := exec.LookPath("omarchy-notification-send"); err == nil {
-		argv = []string{p, "-g", glyph, "-u", urgency, headline, body}
-	} else if p, err := exec.LookPath("notify-send"); err == nil {
-		argv = []string{p, "-a", "crontinental", "-u", urgency, headline, body}
-	} else {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = exec.CommandContext(ctx, argv[0], argv[1:]...).Run() // a missing notifier must never fail a job
-}
-
-func runTool(name string, args ...string) (stdout, stderr []byte, err error) {
-	cmd := exec.Command(name, args...)
-	var out, errb strings.Builder
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	err = cmd.Run()
-	return []byte(out.String()), []byte(errb.String()), err
 }
 
 // joinCommand: one argument after `--` is a shell line, verbatim, so pipes and

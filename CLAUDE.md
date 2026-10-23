@@ -10,7 +10,9 @@ Claude Code setup.
 | path | what |
 |---|---|
 | `cmd/crontinental/` | the whole tool, in Go: one static binary (`CGO_ENABLED=0`) |
-| `systemd/` | the tick (`crontinental.{timer,service}`) |
+| `cmd/crontinental/platform_{linux,darwin}.go` | everything that differs: how a run starts, stops, logs and notifies |
+| `systemd/` | the tick on Linux (`crontinental.{timer,service}`) |
+| `launchd/` | the tick on macOS (a LaunchAgent; `install.sh` fills in its paths) |
 | `completions/` | bash completion |
 | `agents/` | what ships to users' Claude Code: the skill, and the CLAUDE.md snippet |
 | `install.sh` | links everything into place; `--claude-only` touches only Claude Code |
@@ -51,8 +53,19 @@ them the conformance suite when the tool was ported from Python to Go
 
 ## Where it's going
 
-macOS support (launchd for the tick, a process group per run, file logs), then
-release binaries per platform.
+Release binaries per platform (Linux and macOS, amd64 and arm64), so an
+install needs no Go.
+
+## Two platforms
+
+`platform_linux.go` leans on systemd (transient units, the journal,
+RuntimeMaxSec); `platform_darwin.go` does the same jobs itself, in exec: a
+session per run, an flock as the overlap guard (its file names exec's pid and
+the command's process group, for `rm`), the timeout on the process group, a log
+file per job. Behaviour must match: `tests/test_runs.py` starts real runs on
+whichever platform runs it (it skips on Linux without a user manager, i.e. CI),
+and CI runs the whole suite on macOS. Cross-compile for a Mac with
+`GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build`.
 
 ## The grammars are held to the real tools
 

@@ -176,6 +176,34 @@ so a job nobody remembers can be traced back to the session that wanted it.
 That matters here — this is a persistent execution channel that agents can write
 to, and `list` is the audit of it.
 
+## macOS
+
+The same design, with launchd for the heartbeat and exec doing what transient
+units do on Linux:
+
+- **The tick** is a LaunchAgent (`launchd/com.techneosis.crontinental.plist`,
+  written by `install.sh` with absolute paths, since launchd takes no `~`):
+  `StartInterval` 60, `RunAtLoad`. A tick missed while asleep isn't replayed;
+  the first one after waking finds what came due, as on Linux.
+- **A run** is `crontinental exec`, started by the tick in a session of its own
+  (`setsid`), so launchd's cleanup of the tick's process group never reaches
+  it; `AbandonProcessGroup` in the plist is the backstop.
+- **Overlap** is an `flock` on `<ledger dir>/locks/<name>.lock`, held for the
+  whole run. The kernel releases it when exec exits however it exits, so it
+  cannot go stale. The file records exec's pid and the command's process group.
+- **The timeout** is exec's: SIGTERM to the command's process group, SIGKILL
+  ten seconds later, recorded as `killed` (143) exactly as on Linux.
+- **`rm` mid-run** sends exec SIGTERM (it stops the group and records the
+  kill), waits for the lock, and kills the group itself if exec doesn't go.
+- **Output** goes to `~/Library/Logs/crontinental/<name>.log`, which
+  Console.app shows, with a line marking the start and end of each run. A log
+  past 1MiB is rotated to `.1` before the next run; `log` reads both.
+- **The shell** is the user's login shell as Directory Services records it
+  (`dscl`): a LaunchAgent's environment has no `SHELL`, and on macOS the shell
+  is usually zsh, whose profile is where Homebrew lands on PATH.
+- **Notifications** go to Notification Center through `osascript`; critical
+  ones play a sound.
+
 ## Changing a job
 
 `edit <name>` changes a job in place, so its run history and `created_by`
